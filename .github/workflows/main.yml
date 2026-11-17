@@ -34,6 +34,8 @@ jobs:
           cp -rf /tmp/spck_backup/* .
           if [ -f lib/main.dart ]; then
             sed -i 's/CardThemeData/CardTheme/g' lib/main.dart
+            sed -i 's/invokeMethod>/invokeMethod/g' lib/main.dart
+            sed -i 's/List>\.from(/List.from(/g' lib/main.dart
           fi
           sed -i 's/minSdkVersion flutter.minSdkVersion/minSdkVersion 23/g' android/app/build.gradle
 
