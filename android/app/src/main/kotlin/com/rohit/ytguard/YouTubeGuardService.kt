@@ -1,9 +1,12 @@
 package com.rohit.ytguard
 
 import android.accessibilityservice.AccessibilityService
+import android.app.usage.UsageEvents
+import android.app.usage.UsageStatsManager
 import android.content.Context
 import android.graphics.Color
 import android.graphics.PixelFormat
+import android.graphics.Rect
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.media.AudioAttributes
@@ -12,6 +15,7 @@ import android.media.AudioManager
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
+import android.provider.Settings
 import android.text.InputType
 import android.util.TypedValue
 import android.view.Gravity
@@ -27,6 +31,7 @@ import android.widget.TextView
 import android.widget.Toast
 import org.json.JSONObject
 import java.util.Locale
+import kotlin.math.abs
 
 class YouTubeGuardService : AccessibilityService() {
 
@@ -42,19 +47,32 @@ class YouTubeGuardService : AccessibilityService() {
     private var backCooldownUntil = 0L
     private var unverifiedWatchStart = 0L
     private var lastInspectedPkg = ""
+    private var lastDetectedForegroundPkg = ""
 
-    // Temporary session unlocks (in memory)
     private val appUnlockExpiry = HashMap<String, Long>()
     private var settingsUnlockExpiry = 0L
     private var shortsTempUnlockExpiry = 0L
     private var ytVideoTempUnlockExpiry = 0L
 
+    private val usagePollRunnable = object : Runnable {
+        override fun run() {
+            try {
+                checkForegroundAppViaUsageStats()
+            } catch (_: Exception) {
+            }
+            handler.postDelayed(this, 400L)
+        }
+    }
+
     override fun onServiceConnected() {
         super.onServiceConnected()
         windowManager = getSystemService(Context.WINDOW_SERVICE) as WindowManager
+        handler.removeCallbacks(usagePollRunnable)
+        handler.post(usagePollRunnable)
     }
 
     override fun onDestroy() {
+        handler.removeCallbacks(usagePollRunnable)
         removeOverlay()
         super.onDestroy()
     }
@@ -63,34 +81,66 @@ class YouTubeGuardService : AccessibilityService() {
         removeOverlay()
     }
 
+    private fun checkForegroundAppViaUsageStats() {
+        val now = System.currentTimeMillis()
+        if (now < backCooldownUntil || overlayView != null) return
+
+        val config = loadConfig() ?: return
+        if (!config.optBoolean("appBlockerEnabled", false)) return
+
+        val pkg = queryTopPackageUsingUsageStats() ?: return
+        if (pkg.isEmpty() || pkg == packageName || pkg == "com.android.systemui") return
+
+        checkAndBlockApp(pkg, config, now)
+    }
+
+    private fun queryTopPackageUsingUsageStats(): String? {
+        return try {
+            val usm = getSystemService(Context.USAGE_STATS_SERVICE) as? UsageStatsManager ?: return null
+            val end = System.currentTimeMillis()
+            val start = end - 5000L
+            val events = usm.queryEvents(start, end)
+            val event = UsageEvents.Event()
+            var latestPkg: String? = null
+            while (events.hasNextEvent()) {
+                events.getNextEvent(event)
+                if (event.eventType == UsageEvents.Event.ACTIVITY_RESUMED ||
+                    event.eventType == UsageEvents.Event.MOVE_TO_FOREGROUND
+                ) {
+                    latestPkg = event.packageName
+                }
+            }
+            if (!latestPkg.isNullOrEmpty()) {
+                lastDetectedForegroundPkg = latestPkg
+            }
+            lastDetectedForegroundPkg.ifEmpty { null }
+        } catch (_: Exception) {
+            null
+        }
+    }
+
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
         val pkg = event?.packageName?.toString() ?: return
         val now = System.currentTimeMillis()
 
-        // Never block YT Guard itself or System UI / Input methods
-        if (pkg == packageName || pkg == "com.android.systemui" || pkg.contains("inputmethod") || pkg.contains("gboard")) {
+        if (pkg == packageName || pkg == "com.android.systemui" ||
+            pkg.contains("inputmethod") || pkg.contains("gboard")
+        ) {
             return
         }
 
-        // Wait during 1-step back navigation cooldown so previous page loads cleanly
-        if (now < backCooldownUntil) {
-            return
-        }
-
-        // If overlay is already showing, keep it until user taps Go Back or unlocks
-        if (overlayView != null) {
+        if (now < backCooldownUntil || overlayView != null) {
             return
         }
 
         val config = loadConfig() ?: return
 
-        // Reset watch timer if switched app
         if (pkg != lastInspectedPkg) {
             unverifiedWatchStart = 0L
             lastInspectedPkg = pkg
         }
 
-        // 1. SETTINGS TAMPER SHIELD (Uninstall / Clear Data / Accessibility Toggle)
+        // 1. SETTINGS TAMPER SHIELD
         if (isSettingsOrInstallerPackage(pkg)) {
             if (config.optBoolean("tamperShieldEnabled", false) && now >= settingsUnlockExpiry) {
                 val root = rootInActiveWindow ?: return
@@ -99,30 +149,14 @@ class YouTubeGuardService : AccessibilityService() {
             return
         }
 
-        // 2. CUSTOM APP & CATEGORY BLOCKER (For any chosen app on phone)
+        // 2. CUSTOM APP & CATEGORY BLOCKER (Instant via Accessibility + Backup via Usage Stats)
         if (config.optBoolean("appBlockerEnabled", false)) {
-            val unlockUntil = appUnlockExpiry[pkg] ?: 0L
-            if (now >= unlockUntil) {
-                val lockMatch = findAppLockMatch(pkg, config)
-                if (lockMatch != null) {
-                    showFullScreenPopup(
-                        tag = "app:$pkg",
-                        badge = "APP LOCKED",
-                        title = lockMatch.title,
-                        message = lockMatch.message,
-                        expectedPassword = lockMatch.password,
-                        unlockDurationMinutes = 15,
-                        isYouTubeMedia = false,
-                        onUnlocked = {
-                            appUnlockExpiry[pkg] = System.currentTimeMillis() + (15 * 60 * 1000L)
-                        }
-                    )
-                    return
-                }
+            if (checkAndBlockApp(pkg, config, now)) {
+                return
             }
         }
 
-        // 3. YOUTUBE CONTROLS (Only when YouTube is open)
+        // 3. YOUTUBE SHORTS & VIDEO CATEGORY INSPECTION
         if (pkg != YOUTUBE_PKG) {
             unverifiedWatchStart = 0L
             return
@@ -139,43 +173,94 @@ class YouTubeGuardService : AccessibilityService() {
         val root = rootInActiveWindow ?: return
         val allTexts = ArrayList<String>()
         val allViewIds = ArrayList<String>()
+        val screenWidth = resources.displayMetrics.widthPixels
+
         var isShortsTabSelected = false
         var hasMiniplayer = false
         var hasSearchBoxActive = false
+
+        var rightRemixTop = -1
+        var rightShareTop = -1
+        val rightRailTops = ArrayList<Int>()
+        val rightRailLabels = HashSet<String>()
+        val bounds = Rect()
 
         collectNodeTree(root, allTexts, allViewIds) { node ->
             val desc = node.contentDescription?.toString()?.lowercase(Locale.ROOT) ?: ""
             val text = node.text?.toString()?.lowercase(Locale.ROOT) ?: ""
             val id = node.viewIdResourceName?.lowercase(Locale.ROOT) ?: ""
+            val stateDesc = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                node.stateDescription?.toString()?.lowercase(Locale.ROOT) ?: ""
+            } else {
+                ""
+            }
 
-            if (node.isSelected && (desc == "shorts" || text == "shorts")) {
+            if ((desc == "shorts" || text == "shorts" || desc.startsWith("shorts,")) &&
+                (node.isSelected || node.parent?.isSelected == true || stateDesc.contains("selected"))
+            ) {
                 isShortsTabSelected = true
             }
+
             if (id.contains("miniplayer") || id.contains("floaty_bar") || desc.contains("close miniplayer")) {
                 hasMiniplayer = true
             }
             if (id.contains("search_edit_text") && node.isFocused) {
                 hasSearchBoxActive = true
             }
+
+            // Detect YouTube Shorts Vertical Right-Edge Action Rail (Remix, Share, Save, Dislike, Comment)
+            if (shortsEnabled && node.isVisibleToUser) {
+                node.getBoundsInScreen(bounds)
+                if (bounds.left > (screenWidth * 0.68f) && bounds.width() > 0 && bounds.height() > 0) {
+                    val label = when {
+                        desc.contains("remix") || text == "remix" -> "remix"
+                        desc.startsWith("share") || text == "share" -> "share"
+                        desc.contains("dislike") || text == "dislike" -> "dislike"
+                        desc.contains("comment") -> "comment"
+                        desc == "save" || text == "save" || desc.contains("save to playlist") -> "save"
+                        desc.contains("like this video") || desc.startsWith("like ") -> "like"
+                        else -> ""
+                    }
+                    if (label.isNotEmpty()) {
+                        rightRailLabels.add(label)
+                        rightRailTops.add(bounds.top)
+                        if (label == "remix") rightRemixTop = bounds.top
+                        if (label == "share") rightShareTop = bounds.top
+                    }
+                }
+            }
         }
 
-        // Do not interfere while user is typing in YouTube Search
         if (hasSearchBoxActive) {
             unverifiedWatchStart = 0L
             return
         }
 
-        // 3A. YOUTUBE SHORTS FULL-SCREEN POPUP (No Auto-Back)
+        // 3A. SHORTS DETECTION (View IDs + Selected Tab + Vertical Right Rail)
         if (shortsEnabled && now >= shortsTempUnlockExpiry) {
-            val onShortsScreen = isShortsTabSelected || allViewIds.any { id ->
+            val hasShortsViewId = allViewIds.any { id ->
                 id.contains("reel_watch") ||
                 id.contains("reel_recycler") ||
                 id.contains("reel_player") ||
                 id.contains("shorts_player") ||
-                id.contains("reel_main_container")
+                id.contains("reel_main_container") ||
+                id.contains("reel_progress_bar") ||
+                id.contains("reel_channel_bar") ||
+                id.contains("reel_dyn_")
             }
 
-            if (onShortsScreen) {
+            val remixShareStacked = rightRemixTop > 0 && rightShareTop > 0 &&
+                abs(rightRemixTop - rightShareTop) > dp(35)
+
+            val verticalRailSpread = if (rightRailTops.size >= 3) {
+                (rightRailTops.maxOrNull() ?: 0) - (rightRailTops.minOrNull() ?: 0)
+            } else {
+                0
+            }
+            val isVerticalShortsRail = remixShareStacked ||
+                (rightRailLabels.size >= 3 && verticalRailSpread > dp(110))
+
+            if (isShortsTabSelected || hasShortsViewId || isVerticalShortsRail) {
                 stopAllMediaPlayback()
                 val shortsPwd = config.optJSONObject("passwords")?.optString("shorts", "2222") ?: "2222"
                 showFullScreenPopup(
@@ -186,6 +271,7 @@ class YouTubeGuardService : AccessibilityService() {
                     expectedPassword = shortsPwd,
                     unlockDurationMinutes = 15,
                     isYouTubeMedia = true,
+                    isStandaloneAppLock = false,
                     onUnlocked = {
                         shortsTempUnlockExpiry = System.currentTimeMillis() + (15 * 60 * 1000L)
                     }
@@ -194,14 +280,13 @@ class YouTubeGuardService : AccessibilityService() {
             }
         }
 
-        // 3B. ACTIVE VIDEO WATCH PAGE CHECK (Never triggers on Home Feed or Search Results)
+        // 3B. ACTIVE NORMAL VIDEO WATCH PAGE CHECK
         if (!whitelistEnabled && !blacklistEnabled) return
         if (now < ytVideoTempUnlockExpiry) {
             unverifiedWatchStart = 0L
             return
         }
 
-        // Only consider Watch Page if NOT minimized and actual watch-page player + action controls exist
         val hasExpandedPlayer = !hasMiniplayer && allViewIds.any { id ->
             id.contains("watch_while_time_bar") ||
             id.contains("player_fragment_container") ||
@@ -218,7 +303,6 @@ class YouTubeGuardService : AccessibilityService() {
         if (lowerTexts.any { it.startsWith("comments") }) watchSignals++
 
         val isActuallyPlayingVideoPage = hasExpandedPlayer && watchSignals >= 2
-
         if (!isActuallyPlayingVideoPage) {
             unverifiedWatchStart = 0L
             return
@@ -227,7 +311,6 @@ class YouTubeGuardService : AccessibilityService() {
         val combinedScreenText = lowerTexts.joinToString(" | ")
         val ytPwd = config.optJSONObject("passwords")?.optString("ytAdmin", "3333") ?: "3333"
 
-        // Check Title / Keyword Blacklist
         if (blacklistEnabled) {
             val blockedArr = config.optJSONArray("blockedTitleKeywords")
             if (blockedArr != null) {
@@ -244,6 +327,7 @@ class YouTubeGuardService : AccessibilityService() {
                             expectedPassword = ytPwd,
                             unlockDurationMinutes = 15,
                             isYouTubeMedia = true,
+                            isStandaloneAppLock = false,
                             onUnlocked = {
                                 ytVideoTempUnlockExpiry = System.currentTimeMillis() + (15 * 60 * 1000L)
                             }
@@ -254,7 +338,6 @@ class YouTubeGuardService : AccessibilityService() {
             }
         }
 
-        // Check Category / Channel Whitelist
         if (whitelistEnabled) {
             val activeGroup = getActiveGroup(config) ?: return
             val channelsArr = activeGroup.optJSONArray("channels")
@@ -272,7 +355,6 @@ class YouTubeGuardService : AccessibilityService() {
             if (matched) {
                 unverifiedWatchStart = 0L
             } else {
-                // Give 1.1s for YouTube metadata/channel name to finish loading before blocking
                 if (unverifiedWatchStart == 0L) {
                     unverifiedWatchStart = now
                 } else if (now - unverifiedWatchStart >= 1100L) {
@@ -287,6 +369,7 @@ class YouTubeGuardService : AccessibilityService() {
                         expectedPassword = ytPwd,
                         unlockDurationMinutes = 15,
                         isYouTubeMedia = true,
+                        isStandaloneAppLock = false,
                         onUnlocked = {
                             ytVideoTempUnlockExpiry = System.currentTimeMillis() + (15 * 60 * 1000L)
                         }
@@ -296,10 +379,30 @@ class YouTubeGuardService : AccessibilityService() {
         }
     }
 
+    private fun checkAndBlockApp(pkg: String, config: JSONObject, now: Long): Boolean {
+        val unlockUntil = appUnlockExpiry[pkg] ?: 0L
+        if (now < unlockUntil) return false
+
+        val lockMatch = findAppLockMatch(pkg, config) ?: return false
+        showFullScreenPopup(
+            tag = "app:$pkg",
+            badge = "APP LOCKED",
+            title = lockMatch.title,
+            message = lockMatch.message,
+            expectedPassword = lockMatch.password,
+            unlockDurationMinutes = 15,
+            isYouTubeMedia = false,
+            isStandaloneAppLock = true,
+            onUnlocked = {
+                appUnlockExpiry[pkg] = System.currentTimeMillis() + (15 * 60 * 1000L)
+            }
+        )
+        return true
+    }
+
     private data class AppLockMatch(val title: String, val message: String, val password: String)
 
     private fun findAppLockMatch(pkg: String, config: JSONObject): AppLockMatch? {
-        // 1. Check Individual Locked Apps
         val indArr = config.optJSONArray("individualLockedApps")
         if (indArr != null) {
             for (i in 0 until indArr.length()) {
@@ -316,7 +419,6 @@ class YouTubeGuardService : AccessibilityService() {
             }
         }
 
-        // 2. Check App Categories
         val catArr = config.optJSONArray("appCategories")
         if (catArr != null) {
             for (i in 0 until catArr.length()) {
@@ -353,7 +455,6 @@ class YouTubeGuardService : AccessibilityService() {
         collectNodeTree(root, texts, ids) {}
 
         val combined = texts.joinToString(" ").lowercase(Locale.ROOT)
-
         val isTargetProtectedApp = combined.contains("yt guard") || combined.contains("youtube")
         val isAccessibilityScreen = combined.contains("yt guard") && (
             combined.contains("shortcut") ||
@@ -380,6 +481,7 @@ class YouTubeGuardService : AccessibilityService() {
                 expectedPassword = tamperPwd,
                 unlockDurationMinutes = 5,
                 isYouTubeMedia = false,
+                isStandaloneAppLock = false,
                 onUnlocked = {
                     settingsUnlockExpiry = System.currentTimeMillis() + (5 * 60 * 1000L)
                 }
@@ -387,7 +489,6 @@ class YouTubeGuardService : AccessibilityService() {
         }
     }
 
-    // Custom layout that swallows hardware Back key so popup cannot be bypassed accidentally
     private inner class BlockerOverlayLayout(context: Context) : LinearLayout(context) {
         override fun dispatchKeyEvent(event: KeyEvent?): Boolean {
             if (event?.keyCode == KeyEvent.KEYCODE_BACK) {
@@ -405,6 +506,7 @@ class YouTubeGuardService : AccessibilityService() {
         expectedPassword: String,
         unlockDurationMinutes: Int,
         isYouTubeMedia: Boolean,
+        isStandaloneAppLock: Boolean,
         onUnlocked: () -> Unit
     ) {
         handler.post {
@@ -464,7 +566,6 @@ class YouTubeGuardService : AccessibilityService() {
                 }
                 card.addView(msgTv)
 
-                // PRIMARY ACTION: Go Back 1 Page (Clean navigation, never auto-back)
                 val goBackBtn = Button(this).apply {
                     text = "Pichhle Page Par Jayein"
                     isAllCaps = false
@@ -479,18 +580,22 @@ class YouTubeGuardService : AccessibilityService() {
                     setOnClickListener {
                         backCooldownUntil = System.currentTimeMillis() + 1800L
                         unverifiedWatchStart = 0L
+                        lastDetectedForegroundPkg = ""
                         if (isYouTubeMedia) {
                             stopAllMediaPlayback()
                         }
                         removeOverlay()
-                        // Exactly 1 clean back press to return to previous page
                         handler.postDelayed({
-                            performGlobalAction(GLOBAL_ACTION_BACK)
-                            if (isYouTubeMedia) {
-                                handler.postDelayed({
-                                    stopAllMediaPlayback()
-                                    closeYouTubeMiniplayer()
-                                }, 380L)
+                            if (isStandaloneAppLock) {
+                                performGlobalAction(GLOBAL_ACTION_HOME)
+                            } else {
+                                performGlobalAction(GLOBAL_ACTION_BACK)
+                                if (isYouTubeMedia) {
+                                    handler.postDelayed({
+                                        stopAllMediaPlayback()
+                                        closeYouTubeMiniplayer()
+                                    }, 380L)
+                                }
                             }
                         }, 120L)
                     }
@@ -501,7 +606,6 @@ class YouTubeGuardService : AccessibilityService() {
                 ).apply { bottomMargin = dp(18) }
                 card.addView(goBackBtn, btnParams)
 
-                // OPTIONAL PASSWORD UNLOCK SECTION RIGHT ON THE POPUP
                 val pwdInput = EditText(this).apply {
                     hint = "Password daal kar unlock karein..."
                     setHintTextColor(Color.parseColor("#94A3B8"))
@@ -531,7 +635,7 @@ class YouTubeGuardService : AccessibilityService() {
                 card.addView(errorTv)
 
                 val unlockBtn = Button(this).apply {
-                    text = "Unlock (${unlockDurationMinutes} Min)"
+                    text = "Unlock ($unlockDurationMinutes Min)"
                     isAllCaps = false
                     setTextColor(Color.WHITE)
                     setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
@@ -546,7 +650,11 @@ class YouTubeGuardService : AccessibilityService() {
                             onUnlocked()
                             backCooldownUntil = System.currentTimeMillis() + 1000L
                             removeOverlay()
-                            Toast.makeText(this@YouTubeGuardService, "Unlocked for $unlockDurationMinutes min", Toast.LENGTH_SHORT).show()
+                            Toast.makeText(
+                                this@YouTubeGuardService,
+                                "Unlocked for $unlockDurationMinutes min",
+                                Toast.LENGTH_SHORT
+                            ).show()
                         } else {
                             errorTv.text = "Galat password! Sahi password dalein."
                             errorTv.visibility = View.VISIBLE
@@ -570,10 +678,16 @@ class YouTubeGuardService : AccessibilityService() {
                     )
                 )
 
+                val overlayType = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && Settings.canDrawOverlays(this)) {
+                    WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
+                } else {
+                    WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY
+                }
+
                 val params = WindowManager.LayoutParams(
                     WindowManager.LayoutParams.MATCH_PARENT,
                     WindowManager.LayoutParams.MATCH_PARENT,
-                    WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+                    overlayType,
                     WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
                     PixelFormat.TRANSLUCENT
                 ).apply {

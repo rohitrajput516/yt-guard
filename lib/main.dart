@@ -2,8 +2,8 @@ import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
-typedef JsonMap = Map<String,dynamic>;
-typedef AppMap = Map<String,String>;
+typedef JsonMap = Map<String, dynamic>;
+typedef AppMap = Map<String, String>;
 typedef AppList = List<AppMap>;
 
 void main() {
@@ -110,6 +110,30 @@ class GuardBridge {
 
   static Future<void> openAccessibilitySettings() async {
     await _ch.invokeMethod('openAccessibilitySettings');
+  }
+
+  static Future<bool> isOverlayEnabled() async {
+    try {
+      return await _ch.invokeMethod<bool>('isOverlayEnabled') ?? false;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  static Future<void> openOverlaySettings() async {
+    await _ch.invokeMethod('openOverlaySettings');
+  }
+
+  static Future<bool> isUsageAccessEnabled() async {
+    try {
+      return await _ch.invokeMethod<bool>('isUsageAccessEnabled') ?? false;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  static Future<void> openUsageAccessSettings() async {
+    await _ch.invokeMethod('openUsageAccessSettings');
   }
 
   static Future<AppList> getInstalledApps() async {
@@ -226,6 +250,8 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
   late JsonMap _cfg;
   int _tabIndex = 0;
   bool _a11yEnabled = false;
+  bool _overlayEnabled = false;
+  bool _usageEnabled = false;
   AppList _installedApps = [];
 
   @override
@@ -250,11 +276,15 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
   }
 
   Future<void> _refreshStatus() async {
-    final enabled = await GuardBridge.isAccessibilityEnabled();
+    final a11y = await GuardBridge.isAccessibilityEnabled();
+    final overlay = await GuardBridge.isOverlayEnabled();
+    final usage = await GuardBridge.isUsageAccessEnabled();
     final apps = await GuardBridge.getInstalledApps();
     if (mounted) {
       setState(() {
-        _a11yEnabled = enabled;
+        _a11yEnabled = a11y;
+        _overlayEnabled = overlay;
+        _usageEnabled = usage;
         _installedApps = apps;
       });
     }
@@ -357,51 +387,78 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
     );
   }
 
+  Widget _permissionRow({
+    required String title,
+    required String subtitle,
+    required bool granted,
+    required VoidCallback onEnable,
+  }) {
+    return Container(
+      margin: const EdgeInsets.only(bottom: 8),
+      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+      decoration: BoxDecoration(
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: granted ? Colors.green : Colors.orange),
+      ),
+      child: Row(
+        children: [
+          Icon(
+            granted ? Icons.check_circle : Icons.warning_amber_rounded,
+            color: granted ? Colors.green : Colors.orange,
+          ),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(title, style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text(subtitle, style: const TextStyle(fontSize: 11)),
+              ],
+            ),
+          ),
+          if (!granted)
+            FilledButton(
+              onPressed: onEnable,
+              child: const Text('Allow'),
+            ),
+        ],
+      ),
+    );
+  }
+
   Widget _buildControlsTab() {
     return ListView(
       padding: const EdgeInsets.all(16),
       children: [
-        Container(
-          padding: const EdgeInsets.all(16),
-          decoration: BoxDecoration(
-            borderRadius: BorderRadius.circular(14),
-            border: Border.all(
-              color: _a11yEnabled ? Colors.green : Colors.orange,
-            ),
-          ),
-          child: Row(
-            children: [
-              Icon(
-                _a11yEnabled ? Icons.check_circle : Icons.warning_amber_rounded,
-                color: _a11yEnabled ? Colors.green : Colors.orange,
-              ),
-              const SizedBox(width: 12),
-              Expanded(
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Text(
-                      _a11yEnabled
-                          ? 'Accessibility Service Active'
-                          : 'Accessibility Permission Chahiye',
-                      style: const TextStyle(fontWeight: FontWeight.bold),
-                    ),
-                    const Text(
-                      'Permission dene par kuch bhi apne-aap ON nahi hota. Niche se password daal kar ON karein.',
-                      style: TextStyle(fontSize: 12),
-                    ),
-                  ],
-                ),
-              ),
-              if (!_a11yEnabled)
-                FilledButton(
-                  onPressed: GuardBridge.openAccessibilitySettings,
-                  child: const Text('Enable'),
-                ),
-            ],
-          ),
+        const Text(
+          'Required Permissions (Teeno Allow Karein)',
+          style: TextStyle(fontWeight: FontWeight.bold, fontSize: 14),
         ),
-        const SizedBox(height: 16),
+        const SizedBox(height: 8),
+        _permissionRow(
+          title: '1. Accessibility Service',
+          subtitle: 'YouTube Shorts, videos aur Settings detect karne ke liye',
+          granted: _a11yEnabled,
+          onEnable: GuardBridge.openAccessibilitySettings,
+        ),
+        _permissionRow(
+          title: '2. Display Over Other Apps',
+          subtitle: 'Full-screen password lock pop-up dikhane ke liye',
+          granted: _overlayEnabled,
+          onEnable: GuardBridge.openOverlaySettings,
+        ),
+        _permissionRow(
+          title: '3. Usage Access',
+          subtitle: 'Locked apps ko turant track karke block karne ke liye',
+          granted: _usageEnabled,
+          onEnable: GuardBridge.openUsageAccessSettings,
+        ),
+        const SizedBox(height: 12),
+        const Text(
+          'Feature Switches (ON/OFF Dono Ke Liye Password)',
+          style: TextStyle(fontWeight: FontWeight.bold, fontSize: 14),
+        ),
+        const SizedBox(height: 8),
         _featureSwitchTile(
           title: 'YouTube Shorts Blocker',
           subtitle: 'Shorts khulne par full-screen pop-up dikhayega (No auto-back)',
@@ -489,10 +546,24 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
     final individuals = (_cfg['individualLockedApps'] as List)
         .map((e) => JsonMap.from(e as Map))
         .toList();
+    final blockerOn = _cfg['appBlockerEnabled'] == true;
 
     return ListView(
       padding: const EdgeInsets.all(16),
       children: [
+        if (!blockerOn)
+          Container(
+            margin: const EdgeInsets.only(bottom: 14),
+            padding: const EdgeInsets.all(12),
+            decoration: BoxDecoration(
+              borderRadius: BorderRadius.circular(12),
+              border: Border.all(color: Colors.orange),
+            ),
+            child: const Text(
+              'Note: Custom App Blocker abhi OFF hai. Controls tab mein jakar ise ON karein tabhi locked apps par pop-up aayega.',
+              style: TextStyle(fontSize: 12),
+            ),
+          ),
         Row(
           children: [
             Expanded(
