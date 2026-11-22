@@ -8,6 +8,7 @@ import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
+import android.os.PowerManager
 import android.os.Process
 import android.provider.Settings
 import android.text.TextUtils
@@ -35,6 +36,7 @@ class MainActivity : FlutterActivity() {
                             .edit()
                             .putString(KEY_CONFIG, json)
                             .commit()
+                        GuardRuntimeState.bumpConfigVersion()
                         result.success(true)
                     }
                     "loadConfig" -> {
@@ -72,6 +74,24 @@ class MainActivity : FlutterActivity() {
                         startActivity(intent)
                         result.success(true)
                     }
+                    "isBatteryOptimizationIgnored" -> {
+                        result.success(isBatteryUnrestricted())
+                    }
+                    "requestIgnoreBatteryOptimization" -> {
+                        try {
+                            val intent = Intent(
+                                Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
+                                Uri.parse("package:$packageName")
+                            )
+                            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                            startActivity(intent)
+                        } catch (_: Exception) {
+                            val fallback = Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS)
+                            fallback.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                            startActivity(fallback)
+                        }
+                        result.success(true)
+                    }
                     "isDeviceAdminEnabled" -> {
                         result.success(isAdminActive())
                     }
@@ -105,6 +125,15 @@ class MainActivity : FlutterActivity() {
                     else -> result.notImplemented()
                 }
             }
+    }
+
+    private fun isBatteryUnrestricted(): Boolean {
+        return try {
+            val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
+            pm.isIgnoringBatteryOptimizations(packageName)
+        } catch (_: Exception) {
+            false
+        }
     }
 
     private fun isAdminActive(): Boolean {
@@ -170,7 +199,11 @@ class MainActivity : FlutterActivity() {
 
         for (ri in resolveInfos) {
             val pkg = ri.activityInfo?.packageName ?: continue
-            if (pkg == packageName || seen.contains(pkg)) continue
+            val lowerPkg = pkg.lowercase()
+            // Hard-exclude YT Guard itself and PhonePe
+            if (pkg == packageName || lowerPkg == "com.phonepe.app" || lowerPkg.startsWith("com.phonepe.") || seen.contains(pkg)) {
+                continue
+            }
             seen.add(pkg)
             val label = ri.loadLabel(pm)?.toString() ?: pkg
             list.add(mapOf("packageName" to pkg, "appName" to label))

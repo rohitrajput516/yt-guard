@@ -27,6 +27,7 @@ import android.view.View
 import android.view.WindowManager
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
+import android.view.accessibility.AccessibilityWindowInfo
 import android.widget.Button
 import android.widget.EditText
 import android.widget.LinearLayout
@@ -44,15 +45,44 @@ class YouTubeGuardService : AccessibilityService() {
     private val GOOGLE_APP_PKG = "com.google.android.googlequicksearchbox"
     private val GEMINI_PKG = "com.google.android.apps.bard"
     private val PLAY_STORE_PKG = "com.android.vending"
+    private val PHONEPE_PKG = "com.phonepe.app"
+
+    private data class AppLockMatch(
+        val lockKey: String,
+        val title: String,
+        val message: String,
+        val password: String
+    )
+
+    private data class ParsedConfig(
+        val shortsBlockEnabled: Boolean,
+        val ytWhitelistEnabled: Boolean,
+        val ytBlacklistEnabled: Boolean,
+        val tamperShieldEnabled: Boolean,
+        val geminiBlockEnabled: Boolean,
+        val appBlockerEnabled: Boolean,
+        val shortsPwd: String,
+        val ytAdminPwd: String,
+        val tamperPwd: String,
+        val appBlockerPwd: String,
+        val blockedKeywords: List<String>,
+        val activeGroupName: String,
+        val activeChannels: List<String>,
+        val locksByPkg: Map<String, AppLockMatch>,
+        val locksByLabel: Map<String, AppLockMatch>
+    )
 
     private val handler = Handler(Looper.getMainLooper())
     private var windowManager: WindowManager? = null
     private var overlayView: View? = null
     private var activeOverlayTag: String? = null
 
+    private var cachedConfig: ParsedConfig? = null
+    private var cachedConfigVersion = -1L
+    private var cachedRawJson: String? = null
+
     private var lastWindowPkg = ""
     private var lastWindowClass = ""
-    private var lastWindowChangeTime = 0L
     private var preApprovedWatchUntil = 0L
     private var pendingWatchCheckScheduled = false
 
@@ -66,13 +96,13 @@ class YouTubeGuardService : AccessibilityService() {
         }
     }
 
-    private val usageBackupRunnable = object : Runnable {
+    private val fastMonitorRunnable = object : Runnable {
         override fun run() {
             try {
-                runBackupForegroundCheck()
+                runMultiWindowAndUsageSweep()
             } catch (_: Exception) {
             }
-            handler.postDelayed(this, 500L)
+            handler.postDelayed(this, 200L)
         }
     }
 
@@ -83,16 +113,21 @@ class YouTubeGuardService : AccessibilityService() {
         GuardForegroundService.start(this)
 
         try {
-            registerReceiver(screenOffReceiver, IntentFilter(Intent.ACTION_SCREEN_OFF))
+            val filter = IntentFilter(Intent.ACTION_SCREEN_OFF)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                registerReceiver(screenOffReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
+            } else {
+                registerReceiver(screenOffReceiver, filter)
+            }
         } catch (_: Exception) {
         }
 
-        handler.removeCallbacks(usageBackupRunnable)
-        handler.post(usageBackupRunnable)
+        handler.removeCallbacks(fastMonitorRunnable)
+        handler.post(fastMonitorRunnable)
     }
 
     override fun onDestroy() {
-        handler.removeCallbacks(usageBackupRunnable)
+        handler.removeCallbacks(fastMonitorRunnable)
         try {
             unregisterReceiver(screenOffReceiver)
         } catch (_: Exception) {
@@ -109,9 +144,9 @@ class YouTubeGuardService : AccessibilityService() {
         removeOverlay()
     }
 
-    fun performCleanExit(isStandaloneAppLock: Boolean, isYouTubeMedia: Boolean) {
+    fun performCleanExit(goDirectHome: Boolean, isYouTubeMedia: Boolean) {
         handler.postDelayed({
-            if (isStandaloneAppLock) {
+            if (goDirectHome) {
                 performGlobalAction(GLOBAL_ACTION_HOME)
             } else {
                 performGlobalAction(GLOBAL_ACTION_BACK)
@@ -119,51 +154,79 @@ class YouTubeGuardService : AccessibilityService() {
                     handler.postDelayed({
                         stopAllMediaPlayback()
                         closeYouTubeMiniplayer()
-                    }, 320L)
+                    }, 300L)
                 }
             }
-        }, 140L)
+        }, 120L)
     }
 
-    private fun runBackupForegroundCheck() {
+    // =========================================================================
+    // FAST 200MS MULTI-WINDOW + USAGE STATS SWEEP (CATCHES SPLIT-SCREEN, FLOATING, CLONE & HEAVY APPS)
+    // =========================================================================
+    private fun runMultiWindowAndUsageSweep() {
+        if (GuardRuntimeState.isGateActivityVisible || overlayView != null) return
+        val cfg = getCachedConfig() ?: return
         val now = System.currentTimeMillis()
-        if (now < GuardRuntimeState.backCooldownUntil || overlayView != null) return
 
-        val config = loadConfig() ?: return
-        val activePkg = rootInActiveWindow?.packageName?.toString()
-        val pkg = if (!activePkg.isNullOrEmpty() && activePkg != "com.android.systemui") {
-            activePkg
-        } else {
-            queryFreshUsageTopPackage(now)
-        } ?: return
+        val activeRootPkg = rootInActiveWindow?.packageName?.toString()
+        if (isPhonePePackage(activeRootPkg)) return
 
-        if (isIgnoredSystemPackage(pkg)) return
+        // 1. Scan ALL visible application windows (catches Split-Screen & Realme Floating Windows)
+        var sawActiveAppWindow = false
+        val appWindows = try {
+            windows
+        } catch (_: Exception) {
+            null
+        }
 
-        // Check Gemini standalone or Google App Gemini screen
-        if (isGeminiProtectionEnabled(config) && now >= GuardRuntimeState.geminiTempUnlockExpiry) {
-            if (pkg == GEMINI_PKG) {
-                triggerGeminiBlock(config, isStandaloneApp = true)
+        if (appWindows != null) {
+            for (win in appWindows) {
+                if (win.type != AccessibilityWindowInfo.TYPE_APPLICATION) continue
+                val wRoot = win.root ?: continue
+                val wPkg = wRoot.packageName?.toString() ?: continue
+                if (isPhonePePackage(wPkg) || isIgnoredSystemPackage(wPkg)) continue
+                if (isLauncherPackage(wPkg)) continue
+
+                sawActiveAppWindow = true
+                val wTitle = win.title?.toString() ?: ""
+
+                // Tamper Shield check
+                if (cfg.tamperShieldEnabled && now >= GuardRuntimeState.settingsUnlockExpiry) {
+                    if (checkTamperShield(wPkg, wRoot, cfg, now)) return
+                }
+
+                // Complete 4-Way Gemini Blocker check
+                if (isGeminiProtectionEnabled(cfg) && now >= GuardRuntimeState.geminiTempUnlockExpiry) {
+                    if (checkCompleteGeminiBlock(wPkg, wRoot, cfg, now)) return
+                }
+
+                // Custom App & Category Blocker check (Package + Clone/Alias Window Title)
+                if (cfg.appBlockerEnabled) {
+                    if (checkAndBlockCustomApp(wPkg, wTitle, cfg, now)) return
+                }
+            }
+        }
+
+        // 2. Fallback via UsageEvents for games / WebViews / secure apps that hide Accessibility windows
+        if (!sawActiveAppWindow && (activeRootPkg == null || activeRootPkg == "com.android.systemui")) {
+            val topPkg = queryLatestResumedPackage(now) ?: return
+            if (isPhonePePackage(topPkg) || isIgnoredSystemPackage(topPkg) || isLauncherPackage(topPkg)) return
+
+            if (isGeminiProtectionEnabled(cfg) && now >= GuardRuntimeState.geminiTempUnlockExpiry && topPkg == GEMINI_PKG) {
+                triggerGeminiBlock(cfg, isStandaloneApp = true, now = now)
                 return
             }
-            if (pkg == GOOGLE_APP_PKG) {
-                val root = rootInActiveWindow
-                if (root != null && isGeminiScreenInsideGoogleApp(root)) {
-                    triggerGeminiBlock(config, isStandaloneApp = false)
-                    return
-                }
-            }
-        }
 
-        // Check Custom App Blocker
-        if (config.optBoolean("appBlockerEnabled", false)) {
-            checkAndBlockCustomApp(pkg, config, now)
+            if (cfg.appBlockerEnabled) {
+                checkAndBlockCustomApp(topPkg, "", cfg, now)
+            }
         }
     }
 
-    private fun queryFreshUsageTopPackage(now: Long): String? {
+    private fun queryLatestResumedPackage(now: Long): String? {
         return try {
             val usm = getSystemService(Context.USAGE_STATS_SERVICE) as? UsageStatsManager ?: return null
-            val events = usm.queryEvents(now - 3000L, now)
+            val events = usm.queryEvents(now - 60_000L, now)
             val event = UsageEvents.Event()
             var latestPkg: String? = null
             var latestTime = 0L
@@ -178,84 +241,124 @@ class YouTubeGuardService : AccessibilityService() {
                     }
                 }
             }
-            if (latestTime >= lastWindowChangeTime && !latestPkg.isNullOrEmpty()) {
-                latestPkg
-            } else {
-                null
-            }
+            latestPkg
         } catch (_: Exception) {
             null
         }
     }
 
+    // =========================================================================
+    // INSTANT ACCESSIBILITY EVENT HANDLER (0ms LATENCY)
+    // =========================================================================
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
         if (event == null) return
         val eventPkg = event.packageName?.toString() ?: return
         val now = System.currentTimeMillis()
+
+        // Hard-exempt PhonePe immediately
+        if (isPhonePePackage(eventPkg)) return
+
+        // Auto-clear overlay if user navigated back to Home Launcher or YT Guard
+        if ((isLauncherPackage(eventPkg) || eventPkg == packageName) && overlayView != null) {
+            removeOverlay()
+            return
+        }
 
         if (event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED &&
             !isIgnoredSystemPackage(eventPkg)
         ) {
             lastWindowPkg = eventPkg
             lastWindowClass = event.className?.toString() ?: ""
-            lastWindowChangeTime = now
         }
 
         if (isIgnoredSystemPackage(eventPkg)) return
-        if (now < GuardRuntimeState.backCooldownUntil || overlayView != null) return
+        if (GuardRuntimeState.isGateActivityVisible || overlayView != null) return
 
-        val config = loadConfig() ?: return
+        val cfg = getCachedConfig() ?: return
 
-        // Prefer activeRootPkg (100% accurate on Realme), fallback to eventPkg
         val root = rootInActiveWindow
-        val pkg = root?.packageName?.toString()?.takeIf { !isIgnoredSystemPackage(it) } ?: eventPkg
+        val rootPkg = root?.packageName?.toString()
+        if (isPhonePePackage(rootPkg)) return
 
-        // 1. STAGE 1 MICROSECOND YOUTUBE VIDEO TAP CHECK (Before video player even starts)
+        val pkg = rootPkg?.takeIf { !isIgnoredSystemPackage(it) && !isLauncherPackage(it) } ?: eventPkg
+        if (isLauncherPackage(pkg)) return
+
+        // Clear old per-app cooldown if user opened a DIFFERENT app
+        GuardRuntimeState.clearCooldownIfDifferent("app:$pkg")
+
+        // 1. STAGE 1 MICROSECOND YOUTUBE VIDEO TAP CHECK (Before player opens)
         if (pkg == YOUTUBE_PKG && event.eventType == AccessibilityEvent.TYPE_VIEW_CLICKED) {
-            if (handleYouTubeCardTapInstantCheck(event, config, now)) {
-                return
-            }
+            if (handleYouTubeCardTapInstantCheck(event, cfg, now)) return
         }
 
-        // 2. TAMPER SHIELD (Uses LockGateActivity because Android hides overlays on Settings/App Info)
-        if (config.optBoolean("tamperShieldEnabled", false) && now >= GuardRuntimeState.settingsUnlockExpiry) {
-            if (root != null && checkTamperShield(pkg, root, config)) {
-                return
-            }
+        // 2. TAMPER SHIELD (Direct Home via LockGateActivity)
+        if (cfg.tamperShieldEnabled && now >= GuardRuntimeState.settingsUnlockExpiry) {
+            if (root != null && checkTamperShield(pkg, root, cfg, now)) return
         }
 
         // 3. COMPLETE 4-WAY GEMINI BLOCKER (App + Google App Chat + Power-Button Floaty + Play Store + Browser)
-        if (isGeminiProtectionEnabled(config) && now >= GuardRuntimeState.geminiTempUnlockExpiry) {
-            if (checkCompleteGeminiBlock(pkg, root, config)) {
-                return
-            }
+        if (isGeminiProtectionEnabled(cfg) && now >= GuardRuntimeState.geminiTempUnlockExpiry) {
+            if (checkCompleteGeminiBlock(pkg, root, cfg, now)) return
         }
 
-        // 4. CUSTOM APP & CATEGORY BLOCKER (Works for ALL apps including Settings & App Info)
-        if (config.optBoolean("appBlockerEnabled", false)) {
-            if (checkAndBlockCustomApp(pkg, config, now)) {
-                return
-            }
+        // 4. CUSTOM APP & CATEGORY BLOCKER (Fast direct package + window title check, no heavy tree scan)
+        if (cfg.appBlockerEnabled) {
+            val activeTitle = getWindowTitleForPackage(pkg)
+            if (checkAndBlockCustomApp(pkg, activeTitle, cfg, now)) return
         }
 
         // 5. YOUTUBE SHORTS & STAGE 2 WATCH PAGE CHECK
         if (pkg == YOUTUBE_PKG && root != null) {
-            inspectYouTubeScreen(root, config, now)
+            inspectYouTubeScreen(root, cfg, now)
         }
     }
 
+    private fun isPhonePePackage(pkg: String?): Boolean {
+        if (pkg.isNullOrEmpty()) return false
+        val l = pkg.lowercase(Locale.ROOT)
+        return l == PHONEPE_PKG || l.startsWith("com.phonepe.")
+    }
+
+    private fun isLauncherPackage(pkg: String): Boolean {
+        val l = pkg.lowercase(Locale.ROOT)
+        return l == "com.android.launcher" || l.contains(".launcher") || l.endsWith("launcher")
+    }
+
     private fun isIgnoredSystemPackage(pkg: String): Boolean {
-        val lower = pkg.lowercase(Locale.ROOT)
+        if (isPhonePePackage(pkg)) return true
+        val l = pkg.lowercase(Locale.ROOT)
         return pkg == packageName ||
             pkg == "com.android.systemui" ||
-            lower.contains("inputmethod") ||
-            lower.contains("gboard")
+            l.contains("inputmethod") ||
+            l.contains("gboard")
+    }
+
+    private fun getWindowTitleForPackage(pkg: String): String {
+        return try {
+            val wins = windows ?: return ""
+            for (w in wins) {
+                if (w.root?.packageName?.toString() == pkg) {
+                    val t = w.title?.toString()
+                    if (!t.isNullOrBlank()) return t
+                }
+            }
+            ""
+        } catch (_: Exception) {
+            ""
+        }
     }
 
     // =========================================================================
-    // 1. TAMPER SHIELD (SETTINGS / APP INFO / ACCESSIBILITY / DEVICE ADMIN / UNINSTALL)
+    // 1. TAMPER SHIELD -> DIRECT HOME SCREEN (NO SETTINGS FLASH)
     // =========================================================================
-    private fun checkTamperShield(pkg: String, root: AccessibilityNodeInfo, config: JSONObject): Boolean {
+    private fun checkTamperShield(
+        pkg: String,
+        root: AccessibilityNodeInfo,
+        cfg: ParsedConfig,
+        now: Long
+    ): Boolean {
+        if (GuardRuntimeState.isInCooldown("settings_tamper", now)) return false
+
         val lowerPkg = pkg.lowercase(Locale.ROOT)
         val isSettings = lowerPkg.contains("settings") || lowerPkg.contains("appdetail") ||
             lowerPkg.contains("permissioncontroller") || lowerPkg.contains("securitypermission")
@@ -312,17 +415,18 @@ class YouTubeGuardService : AccessibilityService() {
         }
 
         if (shouldLock) {
-            val tamperPwd = config.optJSONObject("passwords")?.optString("tamper", "4444") ?: "4444"
+            removeOverlay()
             LockGateActivity.launch(
                 context = this,
+                cooldownTag = "settings_tamper",
                 badge = "TAMPER SHIELD • PROTECTED",
                 title = lockTitle,
-                message = "Settings ya Uninstall access karne ke liye Tamper Password dalein, ya pichhle page par wapas jayein.",
-                expectedPassword = tamperPwd,
+                message = "Tamper Shield active hai. Seedha Home Screen par jayein ya Tamper Password daal kar unlock karein.",
+                expectedPassword = cfg.tamperPwd,
                 unlockType = "settings",
                 targetKey = "settings",
                 defaultMinutes = 5,
-                isStandaloneAppLock = false,
+                goDirectHome = true,
                 isYouTubeMedia = false
             )
             return true
@@ -333,49 +437,48 @@ class YouTubeGuardService : AccessibilityService() {
     // =========================================================================
     // 2. COMPLETE 4-WAY GEMINI BLOCKER (ZERO IMPACT ON GOOGLE SEARCH)
     // =========================================================================
-    private fun isGeminiProtectionEnabled(config: JSONObject): Boolean {
-        if (config.optBoolean("geminiBlockEnabled", false)) return true
-        if (config.optBoolean("appBlockerEnabled", false)) {
-            if (findAppLockMatch(GEMINI_PKG, config) != null) return true
-        }
+    private fun isGeminiProtectionEnabled(cfg: ParsedConfig): Boolean {
+        if (cfg.geminiBlockEnabled) return true
+        if (cfg.appBlockerEnabled && cfg.locksByPkg.containsKey(GEMINI_PKG)) return true
         return false
     }
 
-    private fun getGeminiPassword(config: JSONObject): String {
-        val customMatch = findAppLockMatch(GEMINI_PKG, config)
-        if (customMatch != null) return customMatch.password
-        return config.optJSONObject("passwords")?.optString("appBlocker", "5555") ?: "5555"
+    private fun getGeminiPassword(cfg: ParsedConfig): String {
+        return cfg.locksByPkg[GEMINI_PKG]?.password ?: cfg.appBlockerPwd
     }
 
-    private fun checkCompleteGeminiBlock(pkg: String, root: AccessibilityNodeInfo?, config: JSONObject): Boolean {
-        // Way 1: Standalone Gemini app wrapper
+    private fun checkCompleteGeminiBlock(
+        pkg: String,
+        root: AccessibilityNodeInfo?,
+        cfg: ParsedConfig,
+        now: Long
+    ): Boolean {
+        if (GuardRuntimeState.isInCooldown("gemini_block", now)) return false
+
         if (pkg == GEMINI_PKG) {
-            triggerGeminiBlock(config, isStandaloneApp = true)
+            triggerGeminiBlock(cfg, isStandaloneApp = true, now = now)
             return true
         }
 
-        // Way 2: Inside Google App (Gemini chat + Power Button / Lockscreen Floaty overlay)
         if (pkg == GOOGLE_APP_PKG && root != null) {
             if (isGeminiScreenInsideGoogleApp(root)) {
-                triggerGeminiBlock(config, isStandaloneApp = false)
+                triggerGeminiBlock(cfg, isStandaloneApp = false, now = now)
                 return true
             }
             return false
         }
 
-        // Way 3: Play Store Google Gemini page (SNAP #9 signature)
         if (pkg == PLAY_STORE_PKG && root != null) {
             if (isPlayStoreGeminiPage(root)) {
-                triggerGeminiBlock(config, isStandaloneApp = false)
+                triggerGeminiBlock(cfg, isStandaloneApp = false, now = now)
                 return true
             }
             return false
         }
 
-        // Way 4: Browsers opening gemini.google.com
         if (isBrowserPackage(pkg) && root != null) {
             if (isBrowserOnGeminiUrl(root)) {
-                triggerGeminiBlock(config, isStandaloneApp = false)
+                triggerGeminiBlock(cfg, isStandaloneApp = false, now = now)
                 return true
             }
         }
@@ -391,7 +494,6 @@ class YouTubeGuardService : AccessibilityService() {
             return true
         }
 
-        // Check active window title == "Gemini" (SNAP #4 & #8)
         try {
             val wins = windows
             if (wins != null) {
@@ -406,7 +508,6 @@ class YouTubeGuardService : AccessibilityService() {
         } catch (_: Exception) {
         }
 
-        // Check exact Robin/Gemini node IDs & controls (SNAP #4 & #8)
         var detected = false
         scanNodesUntil(root) { node ->
             val id = node.viewIdResourceName?.lowercase(Locale.ROOT) ?: ""
@@ -479,84 +580,73 @@ class YouTubeGuardService : AccessibilityService() {
         return found
     }
 
-    private fun triggerGeminiBlock(config: JSONObject, isStandaloneApp: Boolean) {
-        val pwd = getGeminiPassword(config)
+    private fun triggerGeminiBlock(cfg: ParsedConfig, isStandaloneApp: Boolean, now: Long) {
+        if (GuardRuntimeState.isInCooldown("gemini_block", now)) return
+        val pwd = getGeminiPassword(cfg)
         showBlockPopup(
             tag = "gemini_block",
             badge = "GEMINI BLOCKER • LOCKED",
             title = "Gemini Blocked Hai",
-            message = "Gemini har jagah se lock hai (Google Search normal chalta rahega). Pichhle page par jayein ya password se unlock karein.",
+            message = "Gemini har jagah se lock hai (Google Search normal chalta rahega). Bahar jayein ya password se unlock karein.",
             expectedPassword = pwd,
             unlockType = "gemini",
             targetKey = GEMINI_PKG,
             defaultMinutes = 15,
             isYouTubeMedia = false,
-            isStandaloneAppLock = isStandaloneApp,
-            useActivityGate = false
+            goDirectHome = isStandaloneApp,
+            useActivityGate = isStandaloneApp
         )
     }
 
     // =========================================================================
-    // 3. CUSTOM APP & CATEGORY BLOCKER
+    // 3. CUSTOM APP & CATEGORY BLOCKER (ALL APPS EXCEPT PHONEPE -> REAL ACTIVITY GATE)
     // =========================================================================
-    private fun checkAndBlockCustomApp(pkg: String, config: JSONObject, now: Long): Boolean {
-        val unlockUntil = GuardRuntimeState.appUnlockExpiry[pkg] ?: 0L
+    private fun checkAndBlockCustomApp(
+        pkg: String,
+        windowTitle: String,
+        cfg: ParsedConfig,
+        now: Long
+    ): Boolean {
+        if (isPhonePePackage(pkg)) return false
+
+        val lockMatch = findAppLockMatch(pkg, windowTitle, cfg) ?: return false
+        val tag = "app:${lockMatch.lockKey}"
+
+        if (GuardRuntimeState.isInCooldown(tag, now)) return false
+
+        val unlockUntil = GuardRuntimeState.appUnlockExpiry[lockMatch.lockKey] ?: 0L
         if (now < unlockUntil) return false
 
-        val lockMatch = findAppLockMatch(pkg, config) ?: return false
-        val lowerPkg = pkg.lowercase(Locale.ROOT)
-        val needsActivityGate = lowerPkg.contains("settings") || lowerPkg.contains("appdetail")
-
-        showBlockPopup(
-            tag = "app:$pkg",
+        removeOverlay()
+        LockGateActivity.launch(
+            context = this,
+            cooldownTag = tag,
             badge = "APP LOCKED",
             title = lockMatch.title,
             message = lockMatch.message,
             expectedPassword = lockMatch.password,
             unlockType = "app",
-            targetKey = pkg,
+            targetKey = lockMatch.lockKey,
             defaultMinutes = 15,
-            isYouTubeMedia = false,
-            isStandaloneAppLock = true,
-            useActivityGate = needsActivityGate
+            goDirectHome = true,
+            isYouTubeMedia = false
         )
         return true
     }
 
-    private data class AppLockMatch(val title: String, val message: String, val password: String)
+    private fun findAppLockMatch(pkg: String, windowTitle: String, cfg: ParsedConfig): AppLockMatch? {
+        if (isPhonePePackage(pkg)) return null
 
-    private fun findAppLockMatch(pkg: String, config: JSONObject): AppLockMatch? {
-        val indArr = config.optJSONArray("individualLockedApps")
-        if (indArr != null) {
-            for (i in 0 until indArr.length()) {
-                val obj = indArr.optJSONObject(i) ?: continue
-                if (obj.optString("packageName") == pkg) {
-                    val appName = obj.optString("appName", pkg)
-                    val pwd = obj.optString("password", "5555")
-                    return AppLockMatch(
-                        title = "$appName Locked Hai",
-                        message = "Is app ko kholne ke liye iska alag password dalein, ya pichhle page par wapas jayein.",
-                        password = pwd
-                    )
-                }
-            }
-        }
+        // 1. Exact package match (covers normal apps & dual-user clones sharing same package)
+        cfg.locksByPkg[pkg]?.let { return it }
 
-        val catArr = config.optJSONArray("appCategories")
-        if (catArr != null) {
-            for (i in 0 until catArr.length()) {
-                val cat = catArr.optJSONObject(i) ?: continue
-                val pkgs = cat.optJSONArray("packages") ?: continue
-                for (j in 0 until pkgs.length()) {
-                    if (pkgs.optString(j) == pkg) {
-                        val catName = cat.optString("name", "Locked Category")
-                        val pwd = cat.optString("password", "5555")
-                        return AppLockMatch(
-                            title = "Category Locked: $catName",
-                            message = "Ye app [$catName] category mein locked hai. Unlock karne ke liye is category ka password dalein.",
-                            password = pwd
-                        )
-                    }
+        // 2. Window title match for Clone/Alias OEM wrappers
+        val cleanTitle = windowTitle.trim().lowercase(Locale.ROOT)
+        if (cleanTitle.length >= 3 && !cleanTitle.contains("phonepe")) {
+            cfg.locksByLabel[cleanTitle]?.let { return it }
+            for ((label, match) in cfg.locksByLabel) {
+                if (cleanTitle.startsWith("$label (")) {
+                    return match
                 }
             }
         }
@@ -568,20 +658,18 @@ class YouTubeGuardService : AccessibilityService() {
     // =========================================================================
     private fun handleYouTubeCardTapInstantCheck(
         event: AccessibilityEvent,
-        config: JSONObject,
+        cfg: ParsedConfig,
         now: Long
     ): Boolean {
-        val whitelistEnabled = config.optBoolean("ytWhitelistEnabled", false)
-        val blacklistEnabled = config.optBoolean("ytBlacklistEnabled", false)
-        if (!whitelistEnabled && !blacklistEnabled) return false
+        if (!cfg.ytWhitelistEnabled && !cfg.ytBlacklistEnabled) return false
         if (now < GuardRuntimeState.ytVideoTempUnlockExpiry) return false
+        if (GuardRuntimeState.isInCooldown("yt_video", now)) return false
 
         val src = event.source ?: return false
         val srcDesc = src.contentDescription?.toString()?.trim()?.lowercase(Locale.ROOT) ?: ""
         val srcTxt = src.text?.toString()?.trim()?.lowercase(Locale.ROOT) ?: ""
         val srcId = src.viewIdResourceName?.lowercase(Locale.ROOT) ?: ""
 
-        // Ignore toolbar, search box, tabs, action menus, and bottom nav buttons
         val ignoredControls = setOf(
             "action menu", "more options", "more actions", "search", "clear",
             "navigate up", "home", "shorts", "create", "you", "save to library",
@@ -594,7 +682,6 @@ class YouTubeGuardService : AccessibilityService() {
             return false
         }
 
-        // Walk up to the video card container inside RecyclerView(id=results)
         var cardNode: AccessibilityNodeInfo? = src
         var steps = 0
         while (cardNode != null && steps < 4) {
@@ -615,7 +702,6 @@ class YouTubeGuardService : AccessibilityService() {
         val lowerCard = cardTexts.map { it.lowercase(Locale.ROOT) }
         val joined = lowerCard.joinToString(" | ")
 
-        // Confirm it is an actual normal video card (not a Sponsored ad, not Shorts shelf)
         if (joined.contains("sponsored")) return false
         var channelName = ""
         for (t in lowerCard) {
@@ -629,51 +715,45 @@ class YouTubeGuardService : AccessibilityService() {
 
         if (!looksLikeVideoCard) return false
 
-        val ytPwd = config.optJSONObject("passwords")?.optString("ytAdmin", "3333") ?: "3333"
-
-        // Check Blacklist instantly (0ms)
-        if (blacklistEnabled) {
-            val blockedWord = findMatchedBlockedKeyword(joined, config)
+        if (cfg.ytBlacklistEnabled) {
+            val blockedWord = findMatchedBlockedKeyword(joined, cfg)
             if (blockedWord != null) {
                 stopAllMediaPlayback()
                 showBlockPopup(
-                    tag = "yt_keyword",
+                    tag = "yt_video",
                     badge = "YT GUARD • VIDEO BLOCKED",
                     title = "Blocked Keyword Mila",
                     message = "Is video mein blocked shabd \"$blockedWord\" mila hai. Pichhle page par wapas jayein.",
-                    expectedPassword = ytPwd,
+                    expectedPassword = cfg.ytAdminPwd,
                     unlockType = "yt_video",
                     targetKey = "yt_video",
                     defaultMinutes = 15,
                     isYouTubeMedia = true,
-                    isStandaloneAppLock = false,
+                    goDirectHome = false,
                     useActivityGate = false
                 )
                 return true
             }
         }
 
-        // Check Whitelist instantly (0ms)
-        if (whitelistEnabled) {
-            val activeGroup = getActiveGroup(config) ?: return false
+        if (cfg.ytWhitelistEnabled) {
             val targetText = if (channelName.isNotEmpty()) "$channelName | $joined" else joined
-            if (matchesActiveWhitelist(targetText, activeGroup)) {
+            if (matchesActiveWhitelist(targetText, cfg)) {
                 preApprovedWatchUntil = now + 2500L
                 return false
             } else {
                 stopAllMediaPlayback()
-                val groupName = activeGroup.optString("name", "Active Category")
                 showBlockPopup(
-                    tag = "yt_category",
+                    tag = "yt_video",
                     badge = "YT GUARD • CATEGORY LOCK",
                     title = "Alag Category Ki Video",
-                    message = "Ye video aapki active category [$groupName] mein nahi hai. Pichhle page par wapas jayein ya password se unlock karein.",
-                    expectedPassword = ytPwd,
+                    message = "Ye video aapki active category [${cfg.activeGroupName}] mein nahi hai. Pichhle page par wapas jayein ya password se unlock karein.",
+                    expectedPassword = cfg.ytAdminPwd,
                     unlockType = "yt_video",
                     targetKey = "yt_video",
                     defaultMinutes = 15,
                     isYouTubeMedia = true,
-                    isStandaloneAppLock = false,
+                    goDirectHome = false,
                     useActivityGate = false
                 )
                 return true
@@ -683,11 +763,8 @@ class YouTubeGuardService : AccessibilityService() {
         return false
     }
 
-    private fun inspectYouTubeScreen(root: AccessibilityNodeInfo, config: JSONObject, now: Long) {
-        val shortsEnabled = config.optBoolean("shortsBlockEnabled", false)
-        val whitelistEnabled = config.optBoolean("ytWhitelistEnabled", false)
-        val blacklistEnabled = config.optBoolean("ytBlacklistEnabled", false)
-        if (!shortsEnabled && !whitelistEnabled && !blacklistEnabled) return
+    private fun inspectYouTubeScreen(root: AccessibilityNodeInfo, cfg: ParsedConfig, now: Long) {
+        if (!cfg.shortsBlockEnabled && !cfg.ytWhitelistEnabled && !cfg.ytBlacklistEnabled) return
 
         val allViewIds = HashSet<String>()
         var hasMiniplayer = false
@@ -711,8 +788,11 @@ class YouTubeGuardService : AccessibilityService() {
 
         if (hasSearchBoxFocused) return
 
-        // A. EXACT SHORTS PLAYER CHECK (SNAP #6 — ignores stale reel_time_bar!)
-        if (shortsEnabled && now >= GuardRuntimeState.shortsTempUnlockExpiry) {
+        // A. SHORTS CHECK (Ignores stale reel_time_bar)
+        if (cfg.shortsBlockEnabled &&
+            now >= GuardRuntimeState.shortsTempUnlockExpiry &&
+            !GuardRuntimeState.isInCooldown("yt_shorts", now)
+        ) {
             val isTrueShortsPlayer = allViewIds.any { id ->
                 id.endsWith("reel_watch_fragment_root") ||
                 id.endsWith("reel_watch_player") ||
@@ -724,27 +804,27 @@ class YouTubeGuardService : AccessibilityService() {
 
             if (isTrueShortsPlayer) {
                 stopAllMediaPlayback()
-                val shortsPwd = config.optJSONObject("passwords")?.optString("shorts", "2222") ?: "2222"
                 showBlockPopup(
                     tag = "yt_shorts",
                     badge = "YT GUARD • SHORTS BLOCKED",
                     title = "YouTube Shorts Blocked Hai",
                     message = "Pichhle page par wapas jane ke liye button dabayein, ya Shorts password daal kar unlock karein.",
-                    expectedPassword = shortsPwd,
+                    expectedPassword = cfg.shortsPwd,
                     unlockType = "shorts",
                     targetKey = "shorts",
                     defaultMinutes = 15,
                     isYouTubeMedia = true,
-                    isStandaloneAppLock = false,
+                    goDirectHome = false,
                     useActivityGate = false
                 )
                 return
             }
         }
 
-        // B. STAGE 2 WATCH PAGE CHECK (Never fires on Home Feed or Search Results!)
-        if (!whitelistEnabled && !blacklistEnabled) return
+        // B. STAGE 2 WATCH PAGE CHECK
+        if (!cfg.ytWhitelistEnabled && !cfg.ytBlacklistEnabled) return
         if (now < GuardRuntimeState.ytVideoTempUnlockExpiry) return
+        if (GuardRuntimeState.isInCooldown("yt_video", now)) return
         if (hasMiniplayer) return
 
         val hasBrowseOrSearch = allViewIds.any { id ->
@@ -765,9 +845,8 @@ class YouTubeGuardService : AccessibilityService() {
         val headerTexts = ArrayList<String>()
         var hasChannelMarker = false
         var hitLowerSection = false
-        val rect = Rect()
 
-        collectWatchHeaderOnly(wl, headerTexts, rect) { lowerText ->
+        collectWatchHeaderOnly(wl, headerTexts) { lowerText ->
             if (lowerText == "comments" || lowerText == "sponsored" || lowerText.startsWith("sponsored –")) {
                 hitLowerSection = true
                 return@collectWatchHeaderOnly true
@@ -782,89 +861,76 @@ class YouTubeGuardService : AccessibilityService() {
         }
 
         if (headerTexts.isEmpty() || !hasChannelMarker) {
-            // Re-check quickly in 250ms while metadata finishes populating (even if user doesn't touch screen)
             if (!pendingWatchCheckScheduled) {
                 pendingWatchCheckScheduled = true
                 handler.postDelayed({
                     pendingWatchCheckScheduled = false
                     val freshRoot = rootInActiveWindow ?: return@postDelayed
-                    val freshCfg = loadConfig() ?: return@postDelayed
+                    val freshCfg = getCachedConfig() ?: return@postDelayed
                     if (freshRoot.packageName?.toString() == YOUTUBE_PKG && overlayView == null) {
                         inspectYouTubeScreen(freshRoot, freshCfg, System.currentTimeMillis())
                     }
-                }, 250L)
+                }, 220L)
             }
             return
         }
 
         val combinedHeader = headerTexts.joinToString(" | ").lowercase(Locale.ROOT)
-        val ytPwd = config.optJSONObject("passwords")?.optString("ytAdmin", "3333") ?: "3333"
 
-        if (blacklistEnabled) {
-            val blockedWord = findMatchedBlockedKeyword(combinedHeader, config)
+        if (cfg.ytBlacklistEnabled) {
+            val blockedWord = findMatchedBlockedKeyword(combinedHeader, cfg)
             if (blockedWord != null) {
                 stopAllMediaPlayback()
                 showBlockPopup(
-                    tag = "yt_keyword",
+                    tag = "yt_video",
                     badge = "YT GUARD • VIDEO BLOCKED",
                     title = "Blocked Keyword Mila",
                     message = "Is video mein blocked shabd \"$blockedWord\" mila hai. Pichhle page par wapas jayein.",
-                    expectedPassword = ytPwd,
+                    expectedPassword = cfg.ytAdminPwd,
                     unlockType = "yt_video",
                     targetKey = "yt_video",
                     defaultMinutes = 15,
                     isYouTubeMedia = true,
-                    isStandaloneAppLock = false,
+                    goDirectHome = false,
                     useActivityGate = false
                 )
                 return
             }
         }
 
-        if (whitelistEnabled) {
-            val activeGroup = getActiveGroup(config) ?: return
-            if (!matchesActiveWhitelist(combinedHeader, activeGroup)) {
+        if (cfg.ytWhitelistEnabled) {
+            if (!matchesActiveWhitelist(combinedHeader, cfg)) {
                 if (now < preApprovedWatchUntil) {
-                    // Double-check failed even though card looked approved; clear and enforce
                     preApprovedWatchUntil = 0L
                 }
                 stopAllMediaPlayback()
-                val groupName = activeGroup.optString("name", "Active Category")
                 showBlockPopup(
-                    tag = "yt_category",
+                    tag = "yt_video",
                     badge = "YT GUARD • CATEGORY LOCK",
                     title = "Alag Category Ki Video",
-                    message = "Ye video aapki active category [$groupName] mein nahi hai. Pichhle page par wapas jayein ya password se unlock karein.",
-                    expectedPassword = ytPwd,
+                    message = "Ye video aapki active category [${cfg.activeGroupName}] mein nahi hai. Pichhle page par wapas jayein ya password se unlock karein.",
+                    expectedPassword = cfg.ytAdminPwd,
                     unlockType = "yt_video",
                     targetKey = "yt_video",
                     defaultMinutes = 15,
                     isYouTubeMedia = true,
-                    isStandaloneAppLock = false,
+                    goDirectHome = false,
                     useActivityGate = false
                 )
             }
         }
     }
 
-    private fun findMatchedBlockedKeyword(text: String, config: JSONObject): String? {
-        val blockedArr = config.optJSONArray("blockedTitleKeywords") ?: return null
-        for (i in 0 until blockedArr.length()) {
-            val word = blockedArr.optString(i, "").trim().lowercase(Locale.ROOT)
-            if (word.isNotEmpty() && text.contains(word)) {
-                return word
-            }
+    private fun findMatchedBlockedKeyword(text: String, cfg: ParsedConfig): String? {
+        for (word in cfg.blockedKeywords) {
+            if (text.contains(word)) return word
         }
         return null
     }
 
-    private fun matchesActiveWhitelist(text: String, activeGroup: JSONObject): Boolean {
-        val channelsArr = activeGroup.optJSONArray("channels") ?: return false
-        for (i in 0 until channelsArr.length()) {
-            val ch = channelsArr.optString(i, "").trim().lowercase(Locale.ROOT)
-            if (ch.isNotEmpty() && text.contains(ch)) {
-                return true
-            }
+    private fun matchesActiveWhitelist(text: String, cfg: ParsedConfig): Boolean {
+        for (ch in cfg.activeChannels) {
+            if (text.contains(ch)) return true
         }
         return false
     }
@@ -872,7 +938,6 @@ class YouTubeGuardService : AccessibilityService() {
     private fun collectWatchHeaderOnly(
         node: AccessibilityNodeInfo?,
         outTexts: MutableList<String>,
-        rect: Rect,
         shouldStop: (String) -> Boolean
     ): Boolean {
         if (node == null) return false
@@ -891,7 +956,7 @@ class YouTubeGuardService : AccessibilityService() {
         }
 
         for (i in 0 until node.childCount) {
-            if (collectWatchHeaderOnly(node.getChild(i), outTexts, rect, shouldStop)) {
+            if (collectWatchHeaderOnly(node.getChild(i), outTexts, shouldStop)) {
                 return true
             }
         }
@@ -920,12 +985,14 @@ class YouTubeGuardService : AccessibilityService() {
         targetKey: String,
         defaultMinutes: Int,
         isYouTubeMedia: Boolean,
-        isStandaloneAppLock: Boolean,
+        goDirectHome: Boolean,
         useActivityGate: Boolean
     ) {
         if (useActivityGate) {
+            removeOverlay()
             LockGateActivity.launch(
                 context = this,
+                cooldownTag = tag,
                 badge = badge,
                 title = title,
                 message = message,
@@ -933,7 +1000,7 @@ class YouTubeGuardService : AccessibilityService() {
                 unlockType = unlockType,
                 targetKey = targetKey,
                 defaultMinutes = defaultMinutes,
-                isStandaloneAppLock = isStandaloneAppLock,
+                goDirectHome = goDirectHome,
                 isYouTubeMedia = isYouTubeMedia
             )
             return
@@ -1005,8 +1072,8 @@ class YouTubeGuardService : AccessibilityService() {
                 }
                 card.addView(msgTv)
 
-                val goBackBtn = Button(this).apply {
-                    text = "Pichhle Page Par Jayein"
+                val exitBtn = Button(this).apply {
+                    text = if (goDirectHome) "Home Screen Par Jayein" else "Pichhle Page Par Jayein"
                     isAllCaps = false
                     setTextColor(Color.parseColor("#0F172A"))
                     setTextSize(TypedValue.COMPLEX_UNIT_SP, 15f)
@@ -1017,14 +1084,14 @@ class YouTubeGuardService : AccessibilityService() {
                     }
                     setPadding(dp(16), dp(14), dp(16), dp(14))
                     setOnClickListener {
-                        GuardRuntimeState.backCooldownUntil = System.currentTimeMillis() + 1800L
+                        GuardRuntimeState.setCooldown(tag, 1600L)
                         if (isYouTubeMedia) stopAllMediaPlayback()
                         removeOverlay()
-                        performCleanExit(isStandaloneAppLock, isYouTubeMedia)
+                        performCleanExit(goDirectHome, isYouTubeMedia)
                     }
                 }
                 card.addView(
-                    goBackBtn,
+                    exitBtn,
                     LinearLayout.LayoutParams(
                         LinearLayout.LayoutParams.MATCH_PARENT,
                         LinearLayout.LayoutParams.WRAP_CONTENT
@@ -1144,7 +1211,7 @@ class YouTubeGuardService : AccessibilityService() {
                         }
                         if (entered == expectedPassword) {
                             GuardRuntimeState.grantUnlock(unlockType, targetKey, rawMins)
-                            GuardRuntimeState.backCooldownUntil = System.currentTimeMillis() + 1000L
+                            GuardRuntimeState.setCooldown(tag, 1000L)
                             removeOverlay()
                             Toast.makeText(
                                 this@YouTubeGuardService,
@@ -1202,9 +1269,9 @@ class YouTubeGuardService : AccessibilityService() {
                 wm.addView(rootLayout, params)
                 overlayView = rootLayout
             } catch (_: Exception) {
-                // Automatic fallback to real Activity if overlay cannot be drawn
                 LockGateActivity.launch(
                     context = this,
+                    cooldownTag = tag,
                     badge = badge,
                     title = title,
                     message = message,
@@ -1212,7 +1279,7 @@ class YouTubeGuardService : AccessibilityService() {
                     unlockType = unlockType,
                     targetKey = targetKey,
                     defaultMinutes = defaultMinutes,
-                    isStandaloneAppLock = isStandaloneAppLock,
+                    goDirectHome = goDirectHome,
                     isYouTubeMedia = isYouTubeMedia
                 )
             }
@@ -1227,6 +1294,156 @@ class YouTubeGuardService : AccessibilityService() {
         } finally {
             overlayView = null
             activeOverlayTag = null
+        }
+    }
+
+    // =========================================================================
+    // RAM CONFIG CACHE (ZERO JSON PARSING PER SCROLL/EVENT)
+    // =========================================================================
+    private fun getCachedConfig(): ParsedConfig? {
+        val currentVersion = GuardRuntimeState.configVersion
+        if (cachedConfig != null && cachedConfigVersion == currentVersion) {
+            return cachedConfig
+        }
+        val raw = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .getString(KEY_CONFIG, null) ?: return null
+        if (cachedConfig != null && raw == cachedRawJson) {
+            cachedConfigVersion = currentVersion
+            return cachedConfig
+        }
+        val parsed = parseConfig(raw) ?: return cachedConfig
+        cachedConfig = parsed
+        cachedRawJson = raw
+        cachedConfigVersion = currentVersion
+        return parsed
+    }
+
+    private fun parseConfig(raw: String): ParsedConfig? {
+        return try {
+            val json = JSONObject(raw)
+            val pwds = json.optJSONObject("passwords")
+            val shortsPwd = pwds?.optString("shorts", "2222") ?: "2222"
+            val ytAdminPwd = pwds?.optString("ytAdmin", "3333") ?: "3333"
+            val tamperPwd = pwds?.optString("tamper", "4444") ?: "4444"
+            val appBlockerPwd = pwds?.optString("appBlocker", "5555") ?: "5555"
+
+            val keywords = ArrayList<String>()
+            val kwArr = json.optJSONArray("blockedTitleKeywords")
+            if (kwArr != null) {
+                for (i in 0 until kwArr.length()) {
+                    val w = kwArr.optString(i, "").trim().lowercase(Locale.ROOT)
+                    if (w.isNotEmpty()) keywords.add(w)
+                }
+            }
+
+            val activeId = json.optString("activeGroupId", "study")
+            var activeGroupName = "Active Category"
+            val activeChannels = ArrayList<String>()
+            val groupsArr = json.optJSONArray("groups")
+            if (groupsArr != null) {
+                var activeObj: JSONObject? = null
+                for (i in 0 until groupsArr.length()) {
+                    val g = groupsArr.optJSONObject(i) ?: continue
+                    if (g.optString("id") == activeId) {
+                        activeObj = g
+                        break
+                    }
+                }
+                if (activeObj == null && groupsArr.length() > 0) {
+                    activeObj = groupsArr.optJSONObject(0)
+                }
+                if (activeObj != null) {
+                    activeGroupName = activeObj.optString("name", "Active Category")
+                    val chArr = activeObj.optJSONArray("channels")
+                    if (chArr != null) {
+                        for (i in 0 until chArr.length()) {
+                            val ch = chArr.optString(i, "").trim().lowercase(Locale.ROOT)
+                            if (ch.isNotEmpty()) activeChannels.add(ch)
+                        }
+                    }
+                }
+            }
+
+            val locksByPkg = HashMap<String, AppLockMatch>()
+            val locksByLabel = HashMap<String, AppLockMatch>()
+
+            // App Categories first (so individual password overrides category if both set)
+            val catArr = json.optJSONArray("appCategories")
+            if (catArr != null) {
+                for (i in 0 until catArr.length()) {
+                    val cat = catArr.optJSONObject(i) ?: continue
+                    val catName = cat.optString("name", "Locked Category")
+                    val pwd = cat.optString("password", appBlockerPwd)
+                    val pkgs = cat.optJSONArray("packages") ?: continue
+                    for (j in 0 until pkgs.length()) {
+                        val pkg = pkgs.optString(j, "").trim()
+                        if (pkg.isEmpty() || isPhonePePackage(pkg)) continue
+                        val match = AppLockMatch(
+                            lockKey = pkg,
+                            title = "Category Locked: $catName",
+                            message = "Ye app [$catName] category mein locked hai. Home screen par jayein ya is category ka password dalein.",
+                            password = pwd
+                        )
+                        locksByPkg[pkg] = match
+                        val appLabel = resolveAppLabelLower(pkg)
+                        if (appLabel.length >= 3 && !appLabel.contains("phonepe")) {
+                            locksByLabel[appLabel] = match
+                        }
+                    }
+                }
+            }
+
+            // Individual locked apps
+            val indArr = json.optJSONArray("individualLockedApps")
+            if (indArr != null) {
+                for (i in 0 until indArr.length()) {
+                    val obj = indArr.optJSONObject(i) ?: continue
+                    val pkg = obj.optString("packageName", "").trim()
+                    if (pkg.isEmpty() || isPhonePePackage(pkg)) continue
+                    val appName = obj.optString("appName", pkg)
+                    val pwd = obj.optString("password", appBlockerPwd)
+                    val match = AppLockMatch(
+                        lockKey = pkg,
+                        title = "$appName Locked Hai",
+                        message = "Is app ko kholne ke liye iska alag password dalein, ya Home screen par wapas jayein.",
+                        password = pwd
+                    )
+                    locksByPkg[pkg] = match
+                    val lowerName = appName.trim().lowercase(Locale.ROOT)
+                    if (lowerName.length >= 3 && !lowerName.contains("phonepe")) {
+                        locksByLabel[lowerName] = match
+                    }
+                }
+            }
+
+            ParsedConfig(
+                shortsBlockEnabled = json.optBoolean("shortsBlockEnabled", false),
+                ytWhitelistEnabled = json.optBoolean("ytWhitelistEnabled", false),
+                ytBlacklistEnabled = json.optBoolean("ytBlacklistEnabled", false),
+                tamperShieldEnabled = json.optBoolean("tamperShieldEnabled", false),
+                geminiBlockEnabled = json.optBoolean("geminiBlockEnabled", false),
+                appBlockerEnabled = json.optBoolean("appBlockerEnabled", false),
+                shortsPwd = shortsPwd,
+                ytAdminPwd = ytAdminPwd,
+                tamperPwd = tamperPwd,
+                appBlockerPwd = appBlockerPwd,
+                blockedKeywords = keywords,
+                activeGroupName = activeGroupName,
+                activeChannels = activeChannels,
+                locksByPkg = locksByPkg,
+                locksByLabel = locksByLabel
+            )
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    private fun resolveAppLabelLower(pkg: String): String {
+        return try {
+            val ai = packageManager.getApplicationInfo(pkg, 0)
+            packageManager.getApplicationLabel(ai)?.toString()?.trim()?.lowercase(Locale.ROOT) ?: ""
+        } catch (_: Exception) {
+            ""
         }
     }
 
@@ -1316,26 +1533,6 @@ class YouTubeGuardService : AccessibilityService() {
         node.viewIdResourceName?.takeIf { it.isNotBlank() }?.let { viewIds.add(it) }
         for (i in 0 until node.childCount) {
             collectNodeTree(node.getChild(i), texts, viewIds, inspector)
-        }
-    }
-
-    private fun getActiveGroup(config: JSONObject): JSONObject? {
-        val activeId = config.optString("activeGroupId", "study")
-        val arr = config.optJSONArray("groups") ?: return null
-        for (i in 0 until arr.length()) {
-            val g = arr.optJSONObject(i)
-            if (g != null && g.optString("id") == activeId) return g
-        }
-        return if (arr.length() > 0) arr.optJSONObject(0) else null
-    }
-
-    private fun loadConfig(): JSONObject? {
-        val raw = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-            .getString(KEY_CONFIG, null) ?: return null
-        return try {
-            JSONObject(raw)
-        } catch (_: Exception) {
-            null
         }
     }
 

@@ -137,6 +137,18 @@ class GuardBridge {
     await _ch.invokeMethod('openUsageAccessSettings');
   }
 
+  static Future<bool> isBatteryOptimizationIgnored() async {
+    try {
+      return await _ch.invokeMethod<bool>('isBatteryOptimizationIgnored') ?? false;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  static Future<void> requestIgnoreBatteryOptimization() async {
+    await _ch.invokeMethod('requestIgnoreBatteryOptimization');
+  }
+
   static Future<bool> isDeviceAdminEnabled() async {
     try {
       return await _ch.invokeMethod<bool>('isDeviceAdminEnabled') ?? false;
@@ -269,6 +281,7 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
   bool _a11yEnabled = false;
   bool _overlayEnabled = false;
   bool _usageEnabled = false;
+  bool _batteryUnrestricted = false;
   bool _adminEnabled = false;
   AppList _installedApps = [];
 
@@ -297,6 +310,7 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
     final a11y = await GuardBridge.isAccessibilityEnabled();
     final overlay = await GuardBridge.isOverlayEnabled();
     final usage = await GuardBridge.isUsageAccessEnabled();
+    final battery = await GuardBridge.isBatteryOptimizationIgnored();
     final admin = await GuardBridge.isDeviceAdminEnabled();
     final apps = await GuardBridge.getInstalledApps();
     if (mounted) {
@@ -304,6 +318,7 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
         _a11yEnabled = a11y;
         _overlayEnabled = overlay;
         _usageEnabled = usage;
+        _batteryUnrestricted = battery;
         _adminEnabled = admin;
         _installedApps = apps;
       });
@@ -453,33 +468,40 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
       padding: const EdgeInsets.all(16),
       children: [
         const Text(
-          'Permissions & Uninstall Protection',
+          'Permissions & Realme Reliability',
           style: TextStyle(fontWeight: FontWeight.bold, fontSize: 14),
         ),
         const SizedBox(height: 8),
         _permissionRow(
           title: '1. Accessibility Service',
-          subtitle: 'YouTube, Gemini aur Settings detect karne ke liye',
+          subtitle: 'YouTube, Gemini, Settings aur Split-Screen detect karne ke liye',
           granted: _a11yEnabled,
           actionLabel: 'Allow',
           onAction: GuardBridge.openAccessibilitySettings,
         ),
         _permissionRow(
           title: '2. Display Over Other Apps',
-          subtitle: 'Full-screen password pop-up dikhane ke liye',
+          subtitle: 'Full-screen password lock pop-up dikhane ke liye',
           granted: _overlayEnabled,
           actionLabel: 'Allow',
           onAction: GuardBridge.openOverlaySettings,
         ),
         _permissionRow(
           title: '3. Usage Access',
-          subtitle: 'Background app backup tracking ke liye',
+          subtitle: 'Games aur heavy apps ko 200ms mein track karne ke liye',
           granted: _usageEnabled,
           actionLabel: 'Allow',
           onAction: GuardBridge.openUsageAccessSettings,
         ),
         _permissionRow(
-          title: '4. Safe Device Admin (Uninstall Lock)',
+          title: '4. Battery Unrestricted (No Sleep)',
+          subtitle: 'Realme background freeze rokne ke liye zaroori hai',
+          granted: _batteryUnrestricted,
+          actionLabel: 'Allow',
+          onAction: GuardBridge.requestIgnoreBatteryOptimization,
+        ),
+        _permissionRow(
+          title: '5. Safe Device Admin (Uninstall Lock)',
           subtitle: _adminEnabled
               ? 'Active hai — Uninstall button system level par locked hai'
               : 'Optional: Sirf uninstall rokne ke liye (zero wipe risk)',
@@ -553,7 +575,7 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
         ),
         _featureSwitchTile(
           title: 'Settings Tamper Shield',
-          subtitle: 'App Info, Uninstall, Device Admin & Accessibility par real Activity lock',
+          subtitle: 'Accessibility, App Info, Device Admin & Uninstall se seedha Home screen par bhejega',
           value: _cfg['tamperShieldEnabled'] == true,
           onChanged: (v) => _toggleFeatureWithPassword(
             configKey: 'tamperShieldEnabled',
@@ -564,7 +586,7 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
         ),
         _featureSwitchTile(
           title: 'Custom App & Category Blocker',
-          subtitle: 'Select kiye gaye apps/categories par alag password lock lagayega',
+          subtitle: 'Har locked app/clone/floating window par turant lock (PhonePe exempt)',
           value: _cfg['appBlockerEnabled'] == true,
           onChanged: (v) => _toggleFeatureWithPassword(
             configKey: 'appBlockerEnabled',
@@ -619,7 +641,7 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
               border: Border.all(color: Colors.orange),
             ),
             child: const Text(
-              'Note: Custom App Blocker abhi OFF hai. Controls tab mein jakar ise ON karein tabhi locked apps par pop-up aayega.',
+              'Note: Custom App Blocker abhi OFF hai. Controls tab mein jakar ise ON karein tabhi locked apps par lock screen aayegi.',
               style: TextStyle(fontSize: 12),
             ),
           ),

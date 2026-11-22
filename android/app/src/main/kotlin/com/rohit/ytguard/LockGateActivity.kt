@@ -24,9 +24,34 @@ object GuardRuntimeState {
     var shortsTempUnlockExpiry = 0L
     var ytVideoTempUnlockExpiry = 0L
     var geminiTempUnlockExpiry = 0L
-    var backCooldownUntil = 0L
+
+    @Volatile var configVersion = 1L
+    @Volatile var isGateActivityVisible = false
     var lastGateLaunchAt = 0L
     var activeService: YouTubeGuardService? = null
+
+    private var cooldownTag = ""
+    private var cooldownUntil = 0L
+
+    fun bumpConfigVersion() {
+        configVersion++
+    }
+
+    fun setCooldown(tag: String, durationMs: Long) {
+        cooldownTag = tag
+        cooldownUntil = System.currentTimeMillis() + durationMs
+    }
+
+    fun isInCooldown(tag: String, now: Long): Boolean {
+        return tag.isNotEmpty() && tag == cooldownTag && now < cooldownUntil
+    }
+
+    fun clearCooldownIfDifferent(tag: String) {
+        if (tag.isNotEmpty() && tag != cooldownTag) {
+            cooldownTag = ""
+            cooldownUntil = 0L
+        }
+    }
 
     fun clearAllTempUnlocks() {
         appUnlockExpiry.clear()
@@ -61,6 +86,7 @@ class LockGateActivity : Activity() {
     companion object {
         fun launch(
             context: Context,
+            cooldownTag: String,
             badge: String,
             title: String,
             message: String,
@@ -68,11 +94,13 @@ class LockGateActivity : Activity() {
             unlockType: String,
             targetKey: String,
             defaultMinutes: Int,
-            isStandaloneAppLock: Boolean,
+            goDirectHome: Boolean,
             isYouTubeMedia: Boolean
         ) {
             val now = System.currentTimeMillis()
-            if (now - GuardRuntimeState.lastGateLaunchAt < 900L) return
+            if (GuardRuntimeState.isGateActivityVisible && (now - GuardRuntimeState.lastGateLaunchAt < 600L)) {
+                return
+            }
             GuardRuntimeState.lastGateLaunchAt = now
 
             val intent = Intent(context, LockGateActivity::class.java).apply {
@@ -81,6 +109,7 @@ class LockGateActivity : Activity() {
                     Intent.FLAG_ACTIVITY_SINGLE_TOP or
                     Intent.FLAG_ACTIVITY_EXCLUDE_FROM_RECENTS
                 )
+                putExtra("cooldownTag", cooldownTag)
                 putExtra("badge", badge)
                 putExtra("title", title)
                 putExtra("message", message)
@@ -88,7 +117,7 @@ class LockGateActivity : Activity() {
                 putExtra("unlockType", unlockType)
                 putExtra("targetKey", targetKey)
                 putExtra("defaultMinutes", defaultMinutes)
-                putExtra("isStandaloneAppLock", isStandaloneAppLock)
+                putExtra("goDirectHome", goDirectHome)
                 putExtra("isYouTubeMedia", isYouTubeMedia)
             }
             try {
@@ -103,6 +132,21 @@ class LockGateActivity : Activity() {
         renderFromIntent(intent)
     }
 
+    override fun onResume() {
+        super.onResume()
+        GuardRuntimeState.isGateActivityVisible = true
+    }
+
+    override fun onPause() {
+        GuardRuntimeState.isGateActivityVisible = false
+        super.onPause()
+    }
+
+    override fun onDestroy() {
+        GuardRuntimeState.isGateActivityVisible = false
+        super.onDestroy()
+    }
+
     override fun onNewIntent(intent: Intent?) {
         super.onNewIntent(intent)
         if (intent != null) {
@@ -113,18 +157,19 @@ class LockGateActivity : Activity() {
 
     @Suppress("DEPRECATION")
     override fun onBackPressed() {
-        // Hardware back blocked; user must tap Go Back button or unlock
+        // Hardware back blocked; user must tap exit button or unlock
     }
 
     private fun renderFromIntent(intent: Intent) {
+        val cooldownTag = intent.getStringExtra("cooldownTag") ?: "gate"
         val badge = intent.getStringExtra("badge") ?: "YT GUARD • LOCKED"
         val title = intent.getStringExtra("title") ?: "Access Locked"
-        val message = intent.getStringExtra("message") ?: "Pichhle page par jayein ya password dalein."
+        val message = intent.getStringExtra("message") ?: "Home screen par jayein ya password dalein."
         val expectedPassword = intent.getStringExtra("expectedPassword") ?: "0000"
         val unlockType = intent.getStringExtra("unlockType") ?: "settings"
         val targetKey = intent.getStringExtra("targetKey") ?: ""
         val defaultMinutes = (intent.getIntExtra("defaultMinutes", 5)).coerceIn(1, 45)
-        val isStandaloneAppLock = intent.getBooleanExtra("isStandaloneAppLock", false)
+        val goDirectHome = intent.getBooleanExtra("goDirectHome", true)
         val isYouTubeMedia = intent.getBooleanExtra("isYouTubeMedia", false)
 
         val scroll = ScrollView(this).apply {
@@ -177,8 +222,8 @@ class LockGateActivity : Activity() {
         }
         card.addView(msgTv)
 
-        val goBackBtn = Button(this).apply {
-            text = "Pichhle Page Par Jayein"
+        val exitBtn = Button(this).apply {
+            text = if (goDirectHome) "Home Screen Par Jayein" else "Pichhle Page Par Jayein"
             isAllCaps = false
             setTextColor(Color.parseColor("#0F172A"))
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 15f)
@@ -189,13 +234,27 @@ class LockGateActivity : Activity() {
             }
             setPadding(dp(16), dp(14), dp(16), dp(14))
             setOnClickListener {
-                GuardRuntimeState.backCooldownUntil = System.currentTimeMillis() + 2000L
-                finish()
-                GuardRuntimeState.activeService?.performCleanExit(isStandaloneAppLock, isYouTubeMedia)
+                GuardRuntimeState.setCooldown(cooldownTag, 1600L)
+                GuardRuntimeState.isGateActivityVisible = false
+                if (goDirectHome) {
+                    val homeIntent = Intent(Intent.ACTION_MAIN).apply {
+                        addCategory(Intent.CATEGORY_HOME)
+                        flags = Intent.FLAG_ACTIVITY_NEW_TASK
+                    }
+                    try {
+                        startActivity(homeIntent)
+                    } catch (_: Exception) {
+                        GuardRuntimeState.activeService?.performCleanExit(true, false)
+                    }
+                    finishAndRemoveTask()
+                } else {
+                    finishAndRemoveTask()
+                    GuardRuntimeState.activeService?.performCleanExit(false, isYouTubeMedia)
+                }
             }
         }
         card.addView(
-            goBackBtn,
+            exitBtn,
             LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT,
                 LinearLayout.LayoutParams.WRAP_CONTENT
@@ -315,13 +374,14 @@ class LockGateActivity : Activity() {
                 }
                 if (entered == expectedPassword) {
                     GuardRuntimeState.grantUnlock(unlockType, targetKey, rawMins)
-                    GuardRuntimeState.backCooldownUntil = System.currentTimeMillis() + 1200L
+                    GuardRuntimeState.setCooldown(cooldownTag, 1000L)
+                    GuardRuntimeState.isGateActivityVisible = false
                     Toast.makeText(
                         this@LockGateActivity,
                         "Unlocked for $rawMins min",
                         Toast.LENGTH_SHORT
                     ).show()
-                    finish()
+                    finishAndRemoveTask()
                 } else {
                     errorTv.text = "Galat password! Sahi password dalein."
                     errorTv.visibility = View.VISIBLE
