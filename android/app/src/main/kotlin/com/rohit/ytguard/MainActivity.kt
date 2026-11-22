@@ -9,6 +9,8 @@ import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
 
+typealias AppInfoMap = Map<String,String>
+
 class MainActivity : FlutterActivity() {
 
     private val CHANNEL = "com.rohit.ytguard/control"
@@ -70,14 +72,14 @@ class MainActivity : FlutterActivity() {
         return false
     }
 
-    private fun fetchLaunchableApps(): List> {
+    private fun fetchLaunchableApps(): List<AppInfoMap> {
         val pm = packageManager
         val mainIntent = Intent(Intent.ACTION_MAIN, null).apply {
             addCategory(Intent.CATEGORY_LAUNCHER)
         }
         val resolveInfos = pm.queryIntentActivities(mainIntent, PackageManager.MATCH_ALL)
         val seen = HashSet<String>()
-        val list = ArrayList>()
+        val list = ArrayList<AppInfoMap>()
 
         for (ri in resolveInfos) {
             val pkg = ri.activityInfo?.packageName ?: continue

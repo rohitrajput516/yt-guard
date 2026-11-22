@@ -2,6 +2,10 @@ import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
+typedef JsonMap = Map<String,dynamic>;
+typedef AppMap = Map<String,String>;
+typedef AppList = List<AppMap>;
+
 void main() {
   runApp(const YTGuardApp());
 }
@@ -33,9 +37,8 @@ class YTGuardApp extends StatelessWidget {
 class GuardBridge {
   static const MethodChannel _ch = MethodChannel('com.rohit.ytguard/control');
 
-  static Map<String, dynamic> defaultConfig() {
+  static JsonMap defaultConfig() {
     return {
-      // ALL FEATURES START OFF BY DEFAULT EVEN AFTER ACCESSIBILITY PERMISSION
       'shortsBlockEnabled': false,
       'ytWhitelistEnabled': false,
       'ytBlacklistEnabled': false,
@@ -62,12 +65,12 @@ class GuardBridge {
           'channels': ['CodeWithHarry', 'Hitesh Choudhary', 'Fireship'],
         },
       ],
-      'appCategories': >[],
-      'individualLockedApps': >[],
+      'appCategories': <JsonMap>[],
+      'individualLockedApps': <JsonMap>[],
     };
   }
 
-  static Future> loadConfig() async {
+  static Future<JsonMap> loadConfig() async {
     try {
       final raw = await _ch.invokeMethod<String>('loadConfig');
       if (raw == null || raw.isEmpty) {
@@ -75,14 +78,14 @@ class GuardBridge {
         await saveConfig(def);
         return def;
       }
-      final parsed = Map<String, dynamic>.from(jsonDecode(raw));
+      final parsed = JsonMap.from(jsonDecode(raw));
       final def = defaultConfig();
       def.forEach((k, v) {
         parsed.putIfAbsent(k, () => v);
       });
       if (parsed['passwords'] is Map) {
-        final pwds = Map<String, dynamic>.from(parsed['passwords']);
-        (def['passwords'] as Map<String, dynamic>).forEach((k, v) {
+        final pwds = JsonMap.from(parsed['passwords']);
+        (def['passwords'] as JsonMap).forEach((k, v) {
           pwds.putIfAbsent(k, () => v);
         });
         parsed['passwords'] = pwds;
@@ -93,7 +96,7 @@ class GuardBridge {
     }
   }
 
-  static Future<void> saveConfig(Map<String, dynamic> cfg) async {
+  static Future<void> saveConfig(JsonMap cfg) async {
     await _ch.invokeMethod('saveConfig', {'json': jsonEncode(cfg)});
   }
 
@@ -109,22 +112,17 @@ class GuardBridge {
     await _ch.invokeMethod('openAccessibilitySettings');
   }
 
-  static Future<List>> getInstalledApps() async {
+  static Future<AppList> getInstalledApps() async {
     try {
-      final list = await _ch.invokeMethod<List<dynamic>>('getInstalledApps');
-      if (list == null) return [];
-      return list
-          .map((e) => Map<String, String>.from(e as Map))
-          .toList();
+      final rawList = await _ch.invokeMethod('getInstalledApps');
+      if (rawList is! List) return [];
+      return rawList.map((e) => AppMap.from(e as Map)).toList();
     } catch (_) {
       return [];
     }
   }
 }
 
-// ============================================================================
-// MASTER PASSWORD GATE (APP ACCESS LOCK)
-// ============================================================================
 class MasterGateScreen extends StatefulWidget {
   const MasterGateScreen({super.key});
 
@@ -134,7 +132,7 @@ class MasterGateScreen extends StatefulWidget {
 
 class _MasterGateScreenState extends State<MasterGateScreen> {
   final TextEditingController _pwdCtrl = TextEditingController();
-  Map<String, dynamic>? _config;
+  JsonMap? _config;
   String? _error;
 
   @override
@@ -216,11 +214,8 @@ class _MasterGateScreenState extends State<MasterGateScreen> {
   }
 }
 
-// ============================================================================
-// MAIN DASHBOARD WITH 3 TABS
-// ============================================================================
 class DashboardScreen extends StatefulWidget {
-  final Map<String, dynamic> initialConfig;
+  final JsonMap initialConfig;
   const DashboardScreen({super.key, required this.initialConfig});
 
   @override
@@ -228,10 +223,10 @@ class DashboardScreen extends StatefulWidget {
 }
 
 class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingObserver {
-  late Map<String, dynamic> _cfg;
+  late JsonMap _cfg;
   int _tabIndex = 0;
   bool _a11yEnabled = false;
-  List> _installedApps = [];
+  AppList _installedApps = [];
 
   @override
   void initState() {
@@ -362,9 +357,6 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
     );
   }
 
-  // --------------------------------------------------------------------------
-  // TAB 1: FEATURE TOGGLES (ALL DEFAULT OFF, PASSWORD FOR BOTH ON & OFF)
-  // --------------------------------------------------------------------------
   Widget _buildControlsTab() {
     return ListView(
       padding: const EdgeInsets.all(16),
@@ -490,16 +482,13 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
     );
   }
 
-  // --------------------------------------------------------------------------
-  // TAB 2: CUSTOM APP BLOCKER (INDIVIDUAL PASSWORD OR CATEGORY PASSWORD)
-  // --------------------------------------------------------------------------
   Widget _buildAppBlockerTab() {
-    final categories = List>.from(
-      (_cfg['appCategories'] as List).map((e) => Map<String, dynamic>.from(e)),
-    );
-    final individuals = List>.from(
-      (_cfg['individualLockedApps'] as List).map((e) => Map<String, dynamic>.from(e)),
-    );
+    final categories = (_cfg['appCategories'] as List)
+        .map((e) => JsonMap.from(e as Map))
+        .toList();
+    final individuals = (_cfg['individualLockedApps'] as List)
+        .map((e) => JsonMap.from(e as Map))
+        .toList();
 
     return ListView(
       padding: const EdgeInsets.all(16),
@@ -524,8 +513,10 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
           ],
         ),
         const SizedBox(height: 20),
-        const Text('App Categories (Har Category Ka Alag Password)',
-            style: TextStyle(fontWeight: FontWeight.bold, fontSize: 15)),
+        const Text(
+          'App Categories (Har Category Ka Alag Password)',
+          style: TextStyle(fontWeight: FontWeight.bold, fontSize: 15),
+        ),
         const SizedBox(height: 8),
         if (categories.isEmpty)
           const Padding(
@@ -579,8 +570,10 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
           );
         }),
         const SizedBox(height: 20),
-        const Text('Individual Locked Apps (Har App Ka Alag Password)',
-            style: TextStyle(fontWeight: FontWeight.bold, fontSize: 15)),
+        const Text(
+          'Individual Locked Apps (Har App Ka Alag Password)',
+          style: TextStyle(fontWeight: FontWeight.bold, fontSize: 15),
+        ),
         const SizedBox(height: 8),
         if (individuals.isEmpty)
           const Padding(
@@ -689,7 +682,7 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
   }
 
   Future<void> _assignAppsToCategory(int catIndex) async {
-    final cat = Map<String, dynamic>.from((_cfg['appCategories'] as List)[catIndex]);
+    final cat = JsonMap.from((_cfg['appCategories'] as List)[catIndex] as Map);
     final selected = Set<String>.from(cat['packages'] ?? []);
     String query = '';
 
@@ -763,7 +756,7 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
 
   Future<void> _lockIndividualAppDialog() async {
     String query = '';
-    Map<String, String>? pickedApp;
+    AppMap? pickedApp;
     final pwdCtrl = TextEditingController();
 
     await showDialog(
@@ -843,21 +836,20 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
     );
   }
 
-  // --------------------------------------------------------------------------
-  // TAB 3: YOUTUBE CATEGORIES, KEYWORDS & PASSWORDS
-  // --------------------------------------------------------------------------
   Widget _buildYoutubeAndPasswordsTab() {
-    final groups = List>.from(
-      (_cfg['groups'] as List).map((e) => Map<String, dynamic>.from(e)),
-    );
-    final activeId = _cfg['activeGroupId'] ?? 'study';
+    final groups = (_cfg['groups'] as List)
+        .map((e) => JsonMap.from(e as Map))
+        .toList();
+    final activeId = (_cfg['activeGroupId'] ?? 'study').toString();
     final keywords = List<String>.from(_cfg['blockedTitleKeywords'] ?? []);
 
     return ListView(
       padding: const EdgeInsets.all(16),
       children: [
-        const Text('YouTube Active Category (Whitelist)',
-            style: TextStyle(fontWeight: FontWeight.bold, fontSize: 15)),
+        const Text(
+          'YouTube Active Category (Whitelist)',
+          style: TextStyle(fontWeight: FontWeight.bold, fontSize: 15),
+        ),
         const SizedBox(height: 8),
         ...groups.asMap().entries.map((entry) {
           final idx = entry.key;
@@ -875,17 +867,17 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
               ),
             ),
             child: ListTile(
+              onTap: () async {
+                if (!isSelected && await _verifySlotPassword('ytAdmin', 'Category Badlein')) {
+                  _cfg['activeGroupId'] = g['id'];
+                  await _save();
+                }
+              },
               title: Text(g['name'] ?? '', style: const TextStyle(fontWeight: FontWeight.w600)),
               subtitle: Text('Channels: ${chs.join(', ')}', style: const TextStyle(fontSize: 12)),
-              leading: Radio<String>(
-                value: g['id'],
-                groupValue: activeId,
-                onChanged: (v) async {
-                  if (v != null && await _verifySlotPassword('ytAdmin', 'Category Badlein')) {
-                    _cfg['activeGroupId'] = v;
-                    await _save();
-                  }
-                },
+              leading: Icon(
+                isSelected ? Icons.radio_button_checked : Icons.radio_button_off,
+                color: isSelected ? Theme.of(context).colorScheme.primary : null,
               ),
               trailing: IconButton(
                 icon: const Icon(Icons.add),
@@ -898,8 +890,10 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
         Row(
           mainAxisAlignment: MainAxisAlignment.spaceBetween,
           children: [
-            const Text('Blocked Title Keywords',
-                style: TextStyle(fontWeight: FontWeight.bold, fontSize: 15)),
+            const Text(
+              'Blocked Title Keywords',
+              style: TextStyle(fontWeight: FontWeight.bold, fontSize: 15),
+            ),
             TextButton(onPressed: _addBlockedKeyword, child: const Text('+ Add Word')),
           ],
         ),
@@ -918,8 +912,10 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
               .toList(),
         ),
         const Divider(height: 32),
-        const Text('System Passwords Badlein',
-            style: TextStyle(fontWeight: FontWeight.bold, fontSize: 15)),
+        const Text(
+          'System Passwords Badlein',
+          style: TextStyle(fontWeight: FontWeight.bold, fontSize: 15),
+        ),
         const SizedBox(height: 8),
         _passwordTile('Master App Access Password', 'master'),
         _passwordTile('Shorts Blocker Password', 'shorts'),
@@ -958,7 +954,7 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
                 onPressed: () async {
                   final np = ctrl.text.trim();
                   if (np.length >= 4) {
-                    _cfg['passwords'][key] = np;
+                    (_cfg['passwords'] as Map)[key] = np;
                     await _save();
                     if (ctx.mounted) Navigator.pop(ctx);
                   }
