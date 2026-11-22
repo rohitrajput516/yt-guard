@@ -3,6 +3,7 @@ package com.rohit.ytguard
 import android.accessibilityservice.AccessibilityService
 import android.app.usage.UsageEvents
 import android.app.usage.UsageStatsManager
+import android.content.ContentValues
 import android.content.Context
 import android.graphics.Color
 import android.graphics.PixelFormat
@@ -12,9 +13,12 @@ import android.graphics.drawable.GradientDrawable
 import android.media.AudioAttributes
 import android.media.AudioFocusRequest
 import android.media.AudioManager
+import android.net.Uri
 import android.os.Build
+import android.os.Environment
 import android.os.Handler
 import android.os.Looper
+import android.provider.MediaStore
 import android.provider.Settings
 import android.text.InputType
 import android.util.TypedValue
@@ -30,6 +34,9 @@ import android.widget.LinearLayout
 import android.widget.TextView
 import android.widget.Toast
 import org.json.JSONObject
+import java.io.File
+import java.text.SimpleDateFormat
+import java.util.Date
 import java.util.Locale
 import kotlin.math.abs
 
@@ -48,6 +55,13 @@ class YouTubeGuardService : AccessibilityService() {
     private var unverifiedWatchStart = 0L
     private var lastInspectedPkg = ""
     private var lastDetectedForegroundPkg = ""
+
+    private val ENABLE_SNAP_LOGGER = true
+    private var snapButtonView: TextView? = null
+    private var snapCount = 0
+    private var lastWindowPkg = ""
+    private var lastWindowClass = ""
+    private var publicLogUri: Uri? = null
 
     private val appUnlockExpiry = HashMap<String, Long>()
     private var settingsUnlockExpiry = 0L
@@ -69,11 +83,18 @@ class YouTubeGuardService : AccessibilityService() {
         windowManager = getSystemService(Context.WINDOW_SERVICE) as WindowManager
         handler.removeCallbacks(usagePollRunnable)
         handler.post(usagePollRunnable)
+        if (ENABLE_SNAP_LOGGER) {
+            File(filesDir, "ytguard_debug_log.txt").delete()
+            publicLogUri = null
+            snapCount = 0
+            showSnapButton()
+        }
     }
 
     override fun onDestroy() {
         handler.removeCallbacks(usagePollRunnable)
         removeOverlay()
+        removeSnapButton()
         super.onDestroy()
     }
 
@@ -120,8 +141,19 @@ class YouTubeGuardService : AccessibilityService() {
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
-        val pkg = event?.packageName?.toString() ?: return
+        if (event == null) return
+        val pkg = event.packageName?.toString() ?: return
         val now = System.currentTimeMillis()
+
+        if (event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED &&
+            pkg != packageName &&
+            pkg != "com.android.systemui" &&
+            !pkg.contains("inputmethod") &&
+            !pkg.contains("gboard")
+        ) {
+            lastWindowPkg = pkg
+            lastWindowClass = event.className?.toString() ?: ""
+        }
 
         if (pkg == packageName || pkg == "com.android.systemui" ||
             pkg.contains("inputmethod") || pkg.contains("gboard")
@@ -149,7 +181,7 @@ class YouTubeGuardService : AccessibilityService() {
             return
         }
 
-        // 2. CUSTOM APP & CATEGORY BLOCKER (Instant via Accessibility + Backup via Usage Stats)
+        // 2. CUSTOM APP & CATEGORY BLOCKER
         if (config.optBoolean("appBlockerEnabled", false)) {
             if (checkAndBlockApp(pkg, config, now)) {
                 return
@@ -208,7 +240,6 @@ class YouTubeGuardService : AccessibilityService() {
                 hasSearchBoxActive = true
             }
 
-            // Detect YouTube Shorts Vertical Right-Edge Action Rail (Remix, Share, Save, Dislike, Comment)
             if (shortsEnabled && node.isVisibleToUser) {
                 node.getBoundsInScreen(bounds)
                 if (bounds.left > (screenWidth * 0.68f) && bounds.width() > 0 && bounds.height() > 0) {
@@ -236,7 +267,7 @@ class YouTubeGuardService : AccessibilityService() {
             return
         }
 
-        // 3A. SHORTS DETECTION (View IDs + Selected Tab + Vertical Right Rail)
+        // 3A. SHORTS DETECTION
         if (shortsEnabled && now >= shortsTempUnlockExpiry) {
             val hasShortsViewId = allViewIds.any { id ->
                 id.contains("reel_watch") ||
@@ -803,5 +834,171 @@ class YouTubeGuardService : AccessibilityService() {
             value.toFloat(),
             resources.displayMetrics
         ).toInt()
+    }
+
+    private fun showSnapButton() {
+        handler.post {
+            try {
+                removeSnapButton()
+                val wm = windowManager ?: return@post
+                val btn = TextView(this).apply {
+                    text = "SNAP (0)"
+                    setTextColor(Color.WHITE)
+                    setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+                    setTypeface(null, Typeface.BOLD)
+                    setPadding(dp(12), dp(8), dp(12), dp(8))
+                    background = GradientDrawable().apply {
+                        setColor(Color.parseColor("#DC2626"))
+                        cornerRadius = dp(20).toFloat()
+                        setStroke(dp(1), Color.WHITE)
+                    }
+                    setOnClickListener { captureDebugSnapshot() }
+                }
+
+                val overlayType = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && Settings.canDrawOverlays(this)) {
+                    WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
+                } else {
+                    WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY
+                }
+
+                val params = WindowManager.LayoutParams(
+                    WindowManager.LayoutParams.WRAP_CONTENT,
+                    WindowManager.LayoutParams.WRAP_CONTENT,
+                    overlayType,
+                    WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL,
+                    PixelFormat.TRANSLUCENT
+                ).apply {
+                    gravity = Gravity.START or Gravity.CENTER_VERTICAL
+                    x = dp(6)
+                }
+
+                wm.addView(btn, params)
+                snapButtonView = btn
+            } catch (_: Exception) {
+            }
+        }
+    }
+
+    private fun removeSnapButton() {
+        val v = snapButtonView ?: return
+        try {
+            windowManager?.removeView(v)
+        } catch (_: Exception) {
+        } finally {
+            snapButtonView = null
+        }
+    }
+
+    private fun captureDebugSnapshot() {
+        try {
+            snapCount++
+            snapButtonView?.text = "SNAP ($snapCount)"
+
+            val dm = resources.displayMetrics
+            val timeStr = SimpleDateFormat("HH:mm:ss", Locale.US).format(Date())
+            val usagePkg = queryTopPackageUsingUsageStats() ?: "null"
+            val activeRoot = rootInActiveWindow
+
+            val sb = StringBuilder()
+            sb.append("\n==============================\n")
+            sb.append("SNAP #$snapCount @ $timeStr | screen=${dm.widthPixels}x${dm.heightPixels}\n")
+            sb.append("lastWindowPkg=$lastWindowPkg\n")
+            sb.append("lastWindowClass=$lastWindowClass\n")
+            sb.append("usageTopPkg=$usagePkg\n")
+            sb.append("activeRootPkg=${activeRoot?.packageName}\n")
+
+            val wins = windows
+            if (wins != null) {
+                sb.append("windows(${wins.size}):\n")
+                for (w in wins) {
+                    val wr = w.root
+                    sb.append("  type=${w.type} title=${w.title} pkg=${wr?.packageName}\n")
+                }
+            }
+
+            sb.append("nodes:\n")
+            val counter = IntArray(1)
+            if (activeRoot != null) {
+                dumpNodeCompact(activeRoot, 0, sb, counter)
+            }
+
+            val internalFile = File(filesDir, "ytguard_debug_log.txt")
+            internalFile.appendText(sb.toString())
+            saveLogToDownloads(internalFile.readText())
+
+            Toast.makeText(
+                this,
+                "SNAP #$snapCount saved! ($lastWindowPkg)",
+                Toast.LENGTH_SHORT
+            ).show()
+        } catch (e: Exception) {
+            Toast.makeText(this, "SNAP error: ${e.message}", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    private fun dumpNodeCompact(
+        node: AccessibilityNodeInfo?,
+        depth: Int,
+        sb: StringBuilder,
+        counter: IntArray
+    ) {
+        if (node == null || counter[0] >= 260) return
+        val id = node.viewIdResourceName?.substringAfterLast("/") ?: ""
+        val txt = node.text?.toString()?.replace("\n", " ")?.trim()?.take(50) ?: ""
+        val desc = node.contentDescription?.toString()?.replace("\n", " ")?.trim()?.take(50) ?: ""
+        val cls = node.className?.toString()?.substringAfterLast(".") ?: ""
+        val sel = node.isSelected
+        val clk = node.isClickable
+
+        if (id.isNotEmpty() || txt.isNotEmpty() || desc.isNotEmpty() || sel) {
+            val r = Rect()
+            node.getBoundsInScreen(r)
+            sb.append("d$depth [$cls]")
+            if (id.isNotEmpty()) sb.append(" id=$id")
+            if (txt.isNotEmpty()) sb.append(" txt=\"$txt\"")
+            if (desc.isNotEmpty()) sb.append(" desc=\"$desc\"")
+            if (sel) sb.append(" SEL")
+            if (clk) sb.append(" CLK")
+            sb.append(" [${r.left},${r.top},${r.right},${r.bottom}]\n")
+            counter[0]++
+        }
+
+        for (i in 0 until node.childCount) {
+            if (counter[0] >= 260) break
+            dumpNodeCompact(node.getChild(i), depth + 1, sb, counter)
+        }
+    }
+
+    private fun saveLogToDownloads(content: String) {
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                val resolver = contentResolver
+                var uri = publicLogUri
+                if (uri == null) {
+                    val name = "ytguard_snap_${System.currentTimeMillis() / 1000}.txt"
+                    val values = ContentValues().apply {
+                        put(MediaStore.Downloads.DISPLAY_NAME, name)
+                        put(MediaStore.Downloads.MIME_TYPE, "text/plain")
+                        put(MediaStore.Downloads.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS)
+                    }
+                    uri = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
+                    publicLogUri = uri
+                }
+                if (uri != null) {
+                    val stream = try {
+                        resolver.openOutputStream(uri, "wt")
+                    } catch (_: Exception) {
+                        resolver.openOutputStream(uri, "w")
+                    }
+                    stream?.use { out ->
+                        out.write(content.toByteArray(Charsets.UTF_8))
+                    }
+                }
+            } else {
+                val dir = getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS) ?: filesDir
+                File(dir, "ytguard_snap.txt").writeText(content)
+            }
+        } catch (_: Exception) {
+        }
     }
 }
