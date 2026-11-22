@@ -61,6 +61,7 @@ class YouTubeGuardService : AccessibilityService() {
     private var snapCount = 0
     private var lastWindowPkg = ""
     private var lastWindowClass = ""
+    private var lastAutoSnappedScreen = ""
     private var publicLogUri: Uri? = null
 
     private val appUnlockExpiry = HashMap<String, Long>()
@@ -87,6 +88,7 @@ class YouTubeGuardService : AccessibilityService() {
             File(filesDir, "ytguard_debug_log.txt").delete()
             publicLogUri = null
             snapCount = 0
+            lastAutoSnappedScreen = ""
             showSnapButton()
         }
     }
@@ -151,8 +153,18 @@ class YouTubeGuardService : AccessibilityService() {
             !pkg.contains("inputmethod") &&
             !pkg.contains("gboard")
         ) {
+            val cls = event.className?.toString() ?: ""
             lastWindowPkg = pkg
-            lastWindowClass = event.className?.toString() ?: ""
+            lastWindowClass = cls
+
+            // Auto-capture when Android hides overlay on Settings / App Info / Accessibility
+            if (ENABLE_SNAP_LOGGER && isSettingsOrInstallerPackage(pkg)) {
+                val screenKey = "$pkg/$cls"
+                if (screenKey != lastAutoSnappedScreen) {
+                    lastAutoSnappedScreen = screenKey
+                    handler.postDelayed({ captureDebugSnapshot() }, 1500L)
+                }
+            }
         }
 
         if (pkg == packageName || pkg == "com.android.systemui" ||
@@ -477,7 +489,8 @@ class YouTubeGuardService : AccessibilityService() {
                lower.contains("packageinstaller") ||
                lower.contains("securitypermission") ||
                lower.contains("permissioncontroller") ||
-               lower.contains("accessibility")
+               lower.contains("accessibility") ||
+               lower.contains("appdetail")
     }
 
     private fun checkSettingsTamperPopup(root: AccessibilityNodeInfo, config: JSONObject) {
