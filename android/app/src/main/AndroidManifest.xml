@@ -1,22 +1,19 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
-    package="com.rohit.ytguard">
-    
-    <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES" />
+    xmlns:tools="http://schemas.android.com/tools">
+
+    <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES"
+        tools:ignore="QueryAllPackagesPermission" />
     <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
-   <uses-permission android:name="android.permission.PACKAGE_USAGE_STATS" tools:ignore="ProtectedPermissions" />
-
-
-    <queries>
-        <package android:name="com.google.android.youtube" />
-    </queries>
+    <uses-permission android:name="android.permission.PACKAGE_USAGE_STATS"
+        tools:ignore="ProtectedPermissions" />
 
     <application
-        android:label="@string/app_name"
+        android:label="YT Guard"
         android:name="${applicationName}"
         android:icon="@mipmap/ic_launcher">
 
         <activity
-            android:name=".MainActivity"
+            android:name="com.rohit.ytguard.MainActivity"
             android:exported="true"
             android:launchMode="singleTop"
             android:theme="@style/LaunchTheme"
@@ -33,9 +30,9 @@
         </activity>
 
         <service
-            android:name=".YouTubeGuardService"
+            android:name="com.rohit.ytguard.YouTubeGuardService"
             android:exported="true"
-            android:label="@string/app_name"
+            android:label="YT Guard"
             android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
             <intent-filter>
                 <action android:name="android.accessibilityservice.AccessibilityService" />
@@ -49,4 +46,11 @@
             android:name="flutterEmbedding"
             android:value="2" />
     </application>
+
+    <queries>
+        <intent>
+            <action android:name="android.intent.action.PROCESS_TEXT" />
+            <data android:mimeType="text/plain" />
+        </intent>
+    </queries>
 </manifest>
