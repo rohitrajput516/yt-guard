@@ -2,6 +2,7 @@ package com.rohit.ytguard
 
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.provider.Settings
 import android.text.TextUtils
 import io.flutter.embedding.android.FlutterActivity
@@ -9,7 +10,8 @@ import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
 
 class MainActivity : FlutterActivity() {
-    private val CHANNEL = "com.rohit.ytguard/channel"
+
+    private val CHANNEL = "com.rohit.ytguard/control"
     private val PREFS_NAME = "ytguard_prefs"
     private val KEY_CONFIG = "config_json"
 
@@ -18,25 +20,22 @@ class MainActivity : FlutterActivity() {
 
         MethodChannel(flutterEngine.dartExecutor.binaryMessenger, CHANNEL)
             .setMethodCallHandler { call, result ->
-                val prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
                 when (call.method) {
-                    "getState" -> {
-                        val configJson = prefs.getString(KEY_CONFIG, null)
-                        val isServiceEnabled = isAccessibilityServiceEnabled()
-                        val response = mapOf(
-                            "configJson" to configJson,
-                            "isServiceEnabled" to isServiceEnabled
-                        )
-                        result.success(response)
-                    }
                     "saveConfig" -> {
-                        val configJson = call.argument<String>("configJson")
-                        if (configJson != null) {
-                            prefs.edit().putString(KEY_CONFIG, configJson).commit()
-                            result.success(true)
-                        } else {
-                            result.error("INVALID_ARG", "Config JSON is null", null)
-                        }
+                        val json = call.argument<String>("json") ?: "{}"
+                        getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                            .edit()
+                            .putString(KEY_CONFIG, json)
+                            .commit()
+                        result.success(true)
+                    }
+                    "loadConfig" -> {
+                        val json = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                            .getString(KEY_CONFIG, null)
+                        result.success(json)
+                    }
+                    "isAccessibilityEnabled" -> {
+                        result.success(isAccessibilityServiceEnabled())
                     }
                     "openAccessibilitySettings" -> {
                         val intent = Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)
@@ -44,26 +43,50 @@ class MainActivity : FlutterActivity() {
                         startActivity(intent)
                         result.success(true)
                     }
+                    "getInstalledApps" -> {
+                        result.success(fetchLaunchableApps())
+                    }
                     else -> result.notImplemented()
                 }
             }
     }
 
     private fun isAccessibilityServiceEnabled(): Boolean {
-        val expectedComponentName = "$packageName/${YouTubeGuardService::class.java.canonicalName}"
-        val enabledServicesSetting = Settings.Secure.getString(
+        val expected = "${packageName}/${YouTubeGuardService::class.java.canonicalName}"
+        val enabledServices = Settings.Secure.getString(
             contentResolver,
             Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES
         ) ?: return false
-
-        val colonSplitter = TextUtils.SimpleStringSplitter(':')
-        colonSplitter.setString(enabledServicesSetting)
-        while (colonSplitter.hasNext()) {
-            val componentName = colonSplitter.next()
-            if (componentName.equals(expectedComponentName, ignoreCase = true)) {
+        val splitter = TextUtils.SimpleStringSplitter(':')
+        splitter.setString(enabledServices)
+        while (splitter.hasNext()) {
+            val service = splitter.next()
+            if (service.equals(expected, ignoreCase = true) ||
+                service.endsWith("/.YouTubeGuardService", ignoreCase = true)
+            ) {
                 return true
             }
         }
         return false
+    }
+
+    private fun fetchLaunchableApps(): List> {
+        val pm = packageManager
+        val mainIntent = Intent(Intent.ACTION_MAIN, null).apply {
+            addCategory(Intent.CATEGORY_LAUNCHER)
+        }
+        val resolveInfos = pm.queryIntentActivities(mainIntent, PackageManager.MATCH_ALL)
+        val seen = HashSet<String>()
+        val list = ArrayList>()
+
+        for (ri in resolveInfos) {
+            val pkg = ri.activityInfo?.packageName ?: continue
+            if (pkg == packageName || seen.contains(pkg)) continue
+            seen.add(pkg)
+            val label = ri.loadLabel(pm)?.toString() ?: pkg
+            list.add(mapOf("packageName" to pkg, "appName" to label))
+        }
+        list.sortBy { it["appName"]?.lowercase() ?: "" }
+        return list
     }
 }

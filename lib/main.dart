@@ -1,10 +1,8 @@
-import 'dart:async';
 import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
 void main() {
-  WidgetsFlutterBinding.ensureInitialized();
   runApp(const YTGuardApp());
 }
 
@@ -16,1155 +14,620 @@ class YTGuardApp extends StatelessWidget {
     return MaterialApp(
       title: 'YT Guard',
       debugShowCheckedModeBanner: false,
+      themeMode: ThemeMode.system,
       theme: ThemeData(
         useMaterial3: true,
-        scaffoldBackgroundColor: const Color(0xFFF8FAFC),
-        colorScheme: const ColorScheme.light(
-          primary: Color(0xFF0F172A),
-          onPrimary: Color(0xFFFFFFFF),
-          secondary: Color(0xFF334155),
-          surface: Color(0xFFFFFFFF),
-          onSurface: Color(0xFF0F172A),
-          error: Color(0xFFB91C1C),
-        ),
-        appBarTheme: const AppBarTheme(
-          backgroundColor: Color(0xFFFFFFFF),
-          foregroundColor: Color(0xFF0F172A),
-          elevation: 0,
-          centerTitle: false,
-          titleTextStyle: TextStyle(
-            color: Color(0xFF0F172A),
-            fontSize: 18,
-            fontWeight: FontWeight.w700,
-            letterSpacing: -0.3,
-          ),
-        ),
-        cardTheme: CardThemeData(
-          color: const Color(0xFFFFFFFF),
-          elevation: 0,
-          margin: const EdgeInsets.only(bottom: 12),
-          shape: RoundedRectangleBorder(
-            borderRadius: BorderRadius.circular(10),
-            side: const BorderSide(color: Color(0xFFE2E8F0), width: 1),
-          ),
-        ),
+        colorSchemeSeed: const Color(0xFF2563EB),
+        brightness: Brightness.light,
       ),
-      home: const MainDashboard(),
+      darkTheme: ThemeData(
+        useMaterial3: true,
+        colorSchemeSeed: const Color(0xFF3B82F6),
+        brightness: Brightness.dark,
+      ),
+      home: const MasterGateScreen(),
     );
   }
 }
 
-class MainDashboard extends StatefulWidget {
-  const MainDashboard({super.key});
+class GuardBridge {
+  static const MethodChannel _ch = MethodChannel('com.rohit.ytguard/control');
 
-  @override
-  State<MainDashboard> createState() => _MainDashboardState();
+  static Map<String, dynamic> defaultConfig() {
+    return {
+      // ALL FEATURES START OFF BY DEFAULT EVEN AFTER ACCESSIBILITY PERMISSION
+      'shortsBlockEnabled': false,
+      'ytWhitelistEnabled': false,
+      'ytBlacklistEnabled': false,
+      'tamperShieldEnabled': false,
+      'appBlockerEnabled': false,
+      'activeGroupId': 'study',
+      'passwords': {
+        'master': '0000',
+        'shorts': '2222',
+        'ytAdmin': '3333',
+        'tamper': '4444',
+        'appBlocker': '5555',
+      },
+      'blockedTitleKeywords': ['vlog', 'roast', 'prank', 'gossip', 'controversy'],
+      'groups': [
+        {
+          'id': 'study',
+          'name': 'B.Sc & Defence Study',
+          'channels': ['Physics Wallah', 'Defence Wallah', 'Maths Jugad Se'],
+        },
+        {
+          'id': 'coding',
+          'name': 'Coding & Dev',
+          'channels': ['CodeWithHarry', 'Hitesh Choudhary', 'Fireship'],
+        },
+      ],
+      'appCategories': >[],
+      'individualLockedApps': >[],
+    };
+  }
+
+  static Future> loadConfig() async {
+    try {
+      final raw = await _ch.invokeMethod<String>('loadConfig');
+      if (raw == null || raw.isEmpty) {
+        final def = defaultConfig();
+        await saveConfig(def);
+        return def;
+      }
+      final parsed = Map<String, dynamic>.from(jsonDecode(raw));
+      final def = defaultConfig();
+      def.forEach((k, v) {
+        parsed.putIfAbsent(k, () => v);
+      });
+      if (parsed['passwords'] is Map) {
+        final pwds = Map<String, dynamic>.from(parsed['passwords']);
+        (def['passwords'] as Map<String, dynamic>).forEach((k, v) {
+          pwds.putIfAbsent(k, () => v);
+        });
+        parsed['passwords'] = pwds;
+      }
+      return parsed;
+    } catch (_) {
+      return defaultConfig();
+    }
+  }
+
+  static Future<void> saveConfig(Map<String, dynamic> cfg) async {
+    await _ch.invokeMethod('saveConfig', {'json': jsonEncode(cfg)});
+  }
+
+  static Future<bool> isAccessibilityEnabled() async {
+    try {
+      return await _ch.invokeMethod<bool>('isAccessibilityEnabled') ?? false;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  static Future<void> openAccessibilitySettings() async {
+    await _ch.invokeMethod('openAccessibilitySettings');
+  }
+
+  static Future<List>> getInstalledApps() async {
+    try {
+      final list = await _ch.invokeMethod<List<dynamic>>('getInstalledApps');
+      if (list == null) return [];
+      return list
+          .map((e) => Map<String, String>.from(e as Map))
+          .toList();
+    } catch (_) {
+      return [];
+    }
+  }
 }
 
-class _MainDashboardState extends State<MainDashboard> with WidgetsBindingObserver {
-  static const MethodChannel _channel = MethodChannel('com.rohit.ytguard/channel');
+// ============================================================================
+// MASTER PASSWORD GATE (APP ACCESS LOCK)
+// ============================================================================
+class MasterGateScreen extends StatefulWidget {
+  const MasterGateScreen({super.key});
 
-  int _selectedTab = 0;
-  bool _isServiceEnabled = false;
-  bool _isLoading = true;
-  Timer? _uiTimer;
+  @override
+  State<MasterGateScreen> createState() => _MasterGateScreenState();
+}
 
-  late Map<String, dynamic> _config;
+class _MasterGateScreenState extends State<MasterGateScreen> {
+  final TextEditingController _pwdCtrl = TextEditingController();
+  Map<String, dynamic>? _config;
+  String? _error;
 
   @override
   void initState() {
     super.initState();
+    _init();
+  }
+
+  Future<void> _init() async {
+    final cfg = await GuardBridge.loadConfig();
+    if (mounted) setState(() => _config = cfg);
+  }
+
+  void _unlock() {
+    if (_config == null) return;
+    final expected = (_config!['passwords']?['master'] ?? '0000').toString();
+    if (_pwdCtrl.text.trim() == expected) {
+      Navigator.of(context).pushReplacement(
+        MaterialPageRoute(builder: (_) => DashboardScreen(initialConfig: _config!)),
+      );
+    } else {
+      setState(() {
+        _error = 'Galat Master Password! (Default: 0000)';
+        _pwdCtrl.clear();
+      });
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      body: Center(
+        child: SingleChildScrollView(
+          padding: const EdgeInsets.all(24),
+          child: ConstrainedBox(
+            constraints: const BoxConstraints(maxWidth: 380),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                const Icon(Icons.shield_outlined, size: 64),
+                const SizedBox(height: 16),
+                const Text(
+                  'YT Guard Control Panel',
+                  style: TextStyle(fontSize: 22, fontWeight: FontWeight.bold),
+                ),
+                const SizedBox(height: 8),
+                const Text(
+                  'Settings access karne ke liye Master Password dalein',
+                  textAlign: TextAlign.center,
+                ),
+                const SizedBox(height: 24),
+                TextField(
+                  controller: _pwdCtrl,
+                  obscureText: true,
+                  decoration: InputDecoration(
+                    labelText: 'Master Password',
+                    border: const OutlineInputBorder(),
+                    errorText: _error,
+                  ),
+                  onSubmitted: (_) => _unlock(),
+                ),
+                const SizedBox(height: 16),
+                SizedBox(
+                  width: double.infinity,
+                  child: FilledButton(
+                    onPressed: _config == null ? null : _unlock,
+                    child: const Padding(
+                      padding: EdgeInsets.symmetric(vertical: 14),
+                      child: Text('Unlock Dashboard'),
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+// ============================================================================
+// MAIN DASHBOARD WITH 3 TABS
+// ============================================================================
+class DashboardScreen extends StatefulWidget {
+  final Map<String, dynamic> initialConfig;
+  const DashboardScreen({super.key, required this.initialConfig});
+
+  @override
+  State<DashboardScreen> createState() => _DashboardScreenState();
+}
+
+class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingObserver {
+  late Map<String, dynamic> _cfg;
+  int _tabIndex = 0;
+  bool _a11yEnabled = false;
+  List> _installedApps = [];
+
+  @override
+  void initState() {
+    super.initState();
+    _cfg = widget.initialConfig;
     WidgetsBinding.instance.addObserver(this);
-    _config = _defaultConfig();
-    _loadState();
-    _uiTimer = Timer.periodic(const Duration(seconds: 1), (_) {
-      if (mounted) setState(() {});
-    });
+    _refreshStatus();
   }
 
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
-    _uiTimer?.cancel();
     super.dispose();
   }
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
     if (state == AppLifecycleState.resumed) {
-      _loadState();
+      _refreshStatus();
     }
   }
 
-  Map<String, dynamic> _defaultConfig() {
-    return {
-      "passwords": {
-        "family": "1111",
-        "shorts": "2222",
-        "admin": "3333",
-        "switchGroup": "4444",
-        "interest": "5555",
-      },
-      "familyModeExpiry": 0,
-      "shortsUnlockExpiry": 0,
-      "emergencyPassExpiry": 0,
-      "tamperProtection": true,
-      "enforceShortsBlock": true,
-      "enforceWhitelist": true,
-      "enforceTitleBlacklist": true,
-      "enforceInterestFilter": false,
-      "activeGroupId": "study",
-      "blockedTitleKeywords": [
-        "vlog",
-        "roast",
-        "prank",
-        "controversy",
-        "reaction",
-        "gossip"
-      ],
-      "groups": [
-        {
-          "id": "study",
-          "name": "B.Sc & Defence Study",
-          "channels": [
-            "Physics Wallah",
-            "Maths Jugad Se",
-            "Defence Wallah"
-          ],
-          "interests": [
-            "Physics",
-            "Mathematics",
-            "Chemistry",
-            "NDA",
-            "CDS",
-            "CHSL",
-            "B.Sc"
-          ]
-        },
-        {
-          "id": "coding",
-          "name": "Coding & Full-Stack",
-          "channels": [
-            "Flutter",
-            "Fireship",
-            "Traversy Media",
-            "CodeWithHarry",
-            "Hitesh Choudhary"
-          ],
-          "interests": [
-            "Flutter",
-            "Kotlin",
-            "JavaScript",
-            "Python",
-            "Supabase",
-            "Security"
-          ]
-        }
-      ]
-    };
-  }
-
-  Future<void> _loadState() async {
-    try {
-      final res = await _channel.invokeMethod>('getState');
-      if (res != null) {
-        final rawJson = res['configJson'] as String?;
-        final enabled = res['isServiceEnabled'] as bool? ?? false;
-
-        if (rawJson != null && rawJson.isNotEmpty) {
-          _config = jsonDecode(rawJson) as Map<String, dynamic>;
-        } else {
-          _config = _defaultConfig();
-          await _saveConfig();
-        }
-        if (mounted) {
-          setState(() {
-            _isServiceEnabled = enabled;
-            _isLoading = false;
-          });
-        }
-      }
-    } catch (_) {
-      if (mounted) {
-        setState(() => _isLoading = false);
-      }
+  Future<void> _refreshStatus() async {
+    final enabled = await GuardBridge.isAccessibilityEnabled();
+    final apps = await GuardBridge.getInstalledApps();
+    if (mounted) {
+      setState(() {
+        _a11yEnabled = enabled;
+        _installedApps = apps;
+      });
     }
   }
 
-  Future<void> _saveConfig() async {
-    try {
-      final raw = jsonEncode(_config);
-      await _channel.invokeMethod('saveConfig', {'configJson': raw});
-      if (mounted) setState(() {});
-    } catch (_) {}
+  Future<void> _save() async {
+    await GuardBridge.saveConfig(_cfg);
+    if (mounted) setState(() {});
   }
 
-  Future<void> _openAccessibilitySettings() async {
-    try {
-      await _channel.invokeMethod('openAccessibilitySettings');
-    } catch (_) {}
-  }
+  Future<bool> _verifySlotPassword(String slotKey, String title) async {
+    final expected = (_cfg['passwords']?[slotKey] ?? '0000').toString();
+    final ctrl = TextEditingController();
+    bool ok = false;
 
-  int get _now => DateTime.now().millisecondsSinceEpoch;
-
-  bool get _isFamilyModeActive => (_config['familyModeExpiry'] as int? ?? 0) > _now;
-  bool get _isShortsUnlocked => (_config['shortsUnlockExpiry'] as int? ?? 0) > _now;
-  bool get _isEmergencyPassActive => (_config['emergencyPassExpiry'] as int? ?? 0) > _now;
-
-  String _formatRemaining(int expiryMillis) {
-    final diff = expiryMillis - _now;
-    if (diff <= 0) return "00:00";
-    final totalSeconds = diff ~/ 1000;
-    final mins = totalSeconds ~/ 60;
-    final secs = totalSeconds % 60;
-    return "${mins.toString().padLeft(2, '0')}m ${secs.toString().padLeft(2, '0')}s";
-  }
-
-  Future<bool> _verifyPasswordDialog({
-    required String slotKey,
-    required String title,
-    required String subtitle,
-  }) async {
-    final controller = TextEditingController();
-    String? errorText;
-
-    final passwords = Map<String, dynamic>.from(_config['passwords'] as Map);
-    final expected = (passwords[slotKey] ?? '').toString();
-
-    final result = await showDialog<bool>(
-      context: context,
-      barrierDismissible: false,
-      builder: (ctx) {
-        return StatefulBuilder(
-          builder: (ctx, setDialogState) {
-            return AlertDialog(
-              backgroundColor: const Color(0xFFFFFFFF),
-              surfaceTintColor: Colors.transparent,
-              shape: RoundedRectangleBorder(
-                borderRadius: BorderRadius.circular(10),
-                side: const BorderSide(color: Color(0xFFCBD5E1)),
-              ),
-              title: Text(
-                title,
-                style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w700),
-              ),
-              content: Column(
-                mainAxisSize: MainAxisSize.min,
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Text(
-                    subtitle,
-                    style: const TextStyle(fontSize: 13, color: Color(0xFF475569)),
-                  ),
-                  const SizedBox(height: 14),
-                  TextField(
-                    controller: controller,
-                    obscureText: true,
-                    autofocus: true,
-                    decoration: InputDecoration(
-                      labelText: 'Enter Password',
-                      errorText: errorText,
-                      isDense: true,
-                      border: OutlineInputBorder(
-                        borderRadius: BorderRadius.circular(8),
-                      ),
-                    ),
-                  ),
-                ],
-              ),
-              actions: [
-                TextButton(
-                  onPressed: () => Navigator.of(ctx).pop(false),
-                  child: const Text('Cancel', style: TextStyle(color: Color(0xFF64748B))),
-                ),
-                FilledButton(
-                  onPressed: () {
-                    if (controller.text.trim() == expected) {
-                      Navigator.of(ctx).pop(true);
-                    } else {
-                      setDialogState(() {
-                        errorText = 'Incorrect password for this security slot';
-                      });
-                    }
-                  },
-                  child: const Text('Verify'),
-                ),
-              ],
-            );
-          },
-        );
-      },
-    );
-
-    return result ?? false;
-  }
-
-  Future<int?> _selectDurationDialog({
-    required String title,
-    required List<int> minutesOptions,
-  }) async {
-    return showDialog<int>(
-      context: context,
-      builder: (ctx) {
-        return AlertDialog(
-          backgroundColor: const Color(0xFFFFFFFF),
-          surfaceTintColor: Colors.transparent,
-          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
-          title: Text(
-            title,
-            style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w700),
-          ),
-          content: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: minutesOptions.map((mins) {
-              return Container(
-                width: double.infinity,
-                margin: const EdgeInsets.only(bottom: 8),
-                child: OutlinedButton(
-                  onPressed: () => Navigator.of(ctx).pop(mins),
-                  style: OutlinedButton.styleFrom(
-                    padding: const EdgeInsets.symmetric(vertical: 12),
-                    side: const BorderSide(color: Color(0xFFCBD5E1)),
-                    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
-                  ),
-                  child: Text(
-                    '$mins Minutes',
-                    style: const TextStyle(
-                      color: Color(0xFF0F172A),
-                      fontWeight: FontWeight.w600,
-                    ),
-                  ),
-                ),
-              );
-            }).toList(),
-          ),
-        );
-      },
-    );
-  }
-
-  Map<String, dynamic> _getActiveGroup() {
-    final groups = List>.from(
-      (_config['groups'] as List).map((e) => Map<String, dynamic>.from(e as Map)),
-    );
-    final activeId = _config['activeGroupId'] as String? ?? 'study';
-    return groups.firstWhere(
-      (g) => g['id'] == activeId,
-      orElse: () => groups.first,
-    );
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    if (_isLoading) {
-      return const Scaffold(
-        body: Center(child: CircularProgressIndicator()),
-      );
-    }
-
-    return Scaffold(
-      appBar: AppBar(
-        title: const Text('YT GUARD CONTROLLER'),
-        bottom: PreferredSize(
-          preferredSize: const Size.fromHeight(1),
-          child: Container(color: const Color(0xFFE2E8F0), height: 1),
-        ),
-        actions: [
-          Container(
-            margin: const EdgeInsets.only(right: 16),
-            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
-            decoration: BoxDecoration(
-              color: _isFamilyModeActive ? const Color(0xFFFEF3C7) : const Color(0xFFF1F5F9),
-              borderRadius: BorderRadius.circular(6),
-              border: Border.all(
-                color: _isFamilyModeActive ? const Color(0xFFD97706) : const Color(0xFFCBD5E1),
-              ),
-            ),
-            child: Text(
-              _isFamilyModeActive ? 'FAMILY MODE' : 'STRICT MODE',
-              style: TextStyle(
-                fontSize: 11,
-                fontWeight: FontWeight.w700,
-                color: _isFamilyModeActive ? const Color(0xFF92400E) : const Color(0xFF0F172A),
-              ),
-            ),
-          ),
-        ],
-      ),
-      body: IndexedStack(
-        index: _selectedTab,
-        children: [
-          _buildControlCenterTab(),
-          _buildGroupsAndWhitelistTab(),
-          _buildPasswordMatrixTab(),
-        ],
-      ),
-      bottomNavigationBar: Container(
-        decoration: const BoxDecoration(
-          border: Border(top: BorderSide(color: Color(0xFFE2E8F0), width: 1)),
-        ),
-        child: NavigationBar(
-          backgroundColor: const Color(0xFFFFFFFF),
-          indicatorColor: const Color(0xFFE2E8F0),
-          selectedIndex: _selectedTab,
-          onDestinationSelected: (idx) => setState(() => _selectedTab = idx),
-          destinations: const [
-            NavigationDestination(
-              icon: Icon(Icons.shield_outlined),
-              selectedIcon: Icon(Icons.shield),
-              label: 'Controls',
-            ),
-            NavigationDestination(
-              icon: Icon(Icons.layers_outlined),
-              selectedIcon: Icon(Icons.layers),
-              label: 'Groups & Rules',
-            ),
-            NavigationDestination(
-              icon: Icon(Icons.key_outlined),
-              selectedIcon: Icon(Icons.key),
-              label: 'Passwords',
-            ),
-          ],
-        ),
-      ),
-    );
-  }
-
-  // ===========================================================================
-  // TAB 1: CONTROL CENTER
-  // ===========================================================================
-  Widget _buildControlCenterTab() {
-    final activeGroup = _getActiveGroup();
-
-    return ListView(
-      padding: const EdgeInsets.all(16),
-      children: [
-        // Accessibility Service Status Banner
-        Card(
-          color: _isServiceEnabled ? const Color(0xFFF8FAFC) : const Color(0xFFFEF2F2),
-          child: Padding(
-            padding: const EdgeInsets.all(16),
-            child: Row(
-              children: [
-                Icon(
-                  _isServiceEnabled ? Icons.verified_user : Icons.warning_amber_rounded,
-                  color: _isServiceEnabled ? const Color(0xFF0F172A) : const Color(0xFFB91C1C),
-                ),
-                const SizedBox(width: 12),
-                Expanded(
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Text(
-                        _isServiceEnabled
-                            ? 'Accessibility Engine Active'
-                            : 'Accessibility Permission Required',
-                        style: const TextStyle(fontWeight: FontWeight.w700, fontSize: 14),
-                      ),
-                      const SizedBox(height: 2),
-                      Text(
-                        _isServiceEnabled
-                            ? 'Monitoring official YouTube app in real time.'
-                            : 'Enable YT Guard in Accessibility Settings to enforce locks.',
-                        style: const TextStyle(fontSize: 12, color: Color(0xFF475569)),
-                      ),
-                    ],
-                  ),
-                ),
-                if (!_isServiceEnabled)
-                  FilledButton(
-                    onPressed: _openAccessibilitySettings,
-                    child: const Text('Enable'),
-                  ),
-              ],
-            ),
-          ),
-        ),
-
-        // Family Mode Card
-        Card(
-          child: Padding(
-            padding: const EdgeInsets.all(16),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Row(
-                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                  children: [
-                    const Text(
-                      'Family Mode (Unrestricted YouTube)',
-                      style: TextStyle(fontWeight: FontWeight.w700, fontSize: 15),
-                    ),
-                    Text(
-                      _isFamilyModeActive
-                          ? _formatRemaining(_config['familyModeExpiry'] as int)
-                          : 'LOCKED',
-                      style: TextStyle(
-                        fontWeight: FontWeight.w700,
-                        fontSize: 12,
-                        color: _isFamilyModeActive
-                            ? const Color(0xFFB45309)
-                            : const Color(0xFF475569),
-                      ),
-                    ),
-                  ],
-                ),
-                const SizedBox(height: 6),
-                const Text(
-                  'Temporarily disables all YouTube restrictions for family members. Auto-locks when timer ends or if phone screen stays off for 5 minutes.',
-                  style: TextStyle(fontSize: 12, color: Color(0xFF475569)),
-                ),
-                const SizedBox(height: 14),
-                SizedBox(
-                  width: double.infinity,
-                  child: _isFamilyModeActive
-                      ? FilledButton.icon(
-                          onPressed: () {
-                            // One-Way Lock: Zero password required to lock back!
-                            _config['familyModeExpiry'] = 0;
-                            _saveConfig();
-                          },
-                          icon: const Icon(Icons.lock, size: 18),
-                          label: const Text('Lock Into Study Mode Now (No Password)'),
-                        )
-                      : OutlinedButton.icon(
-                          onPressed: () async {
-                            final ok = await _verifyPasswordDialog(
-                              slotKey: 'family',
-                              title: 'Unlock Family Mode',
-                              subtitle: 'Requires Password #1 (Family Mode Password).',
-                            );
-                            if (!ok) return;
-                            final mins = await _selectDurationDialog(
-                              title: 'Select Family Mode Duration',
-                              minutesOptions: [15, 30, 60, 120, 180],
-                            );
-                            if (mins != null) {
-                              _config['familyModeExpiry'] = _now + (mins * 60 * 1000);
-                              await _saveConfig();
-                            }
-                          },
-                          icon: const Icon(Icons.lock_open, size: 18),
-                          label: const Text('Unlock for Family (Password #1)'),
-                        ),
-                ),
-              ],
-            ),
-          ),
-        ),
-
-        // YouTube Shorts Lock Card
-        Card(
-          child: Padding(
-            padding: const EdgeInsets.all(16),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Row(
-                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                  children: [
-                    const Text(
-                      'YouTube Shorts Blocker',
-                      style: TextStyle(fontWeight: FontWeight.w700, fontSize: 15),
-                    ),
-                    Text(
-                      _isShortsUnlocked
-                          ? 'UNLOCKED (${_formatRemaining(_config['shortsUnlockExpiry'] as int)})'
-                          : 'BLOCKED',
-                      style: TextStyle(
-                        fontWeight: FontWeight.w700,
-                        fontSize: 12,
-                        color: _isShortsUnlocked
-                            ? const Color(0xFFB91C1C)
-                            : const Color(0xFF0F172A),
-                      ),
-                    ),
-                  ],
-                ),
-                const SizedBox(height: 6),
-                const Text(
-                  'Blocks Shorts tab, Shorts player, and vertical reel feeds everywhere inside the YouTube app.',
-                  style: TextStyle(fontSize: 12, color: Color(0xFF475569)),
-                ),
-                const SizedBox(height: 14),
-                SizedBox(
-                  width: double.infinity,
-                  child: _isShortsUnlocked
-                      ? FilledButton.icon(
-                          onPressed: () {
-                            _config['shortsUnlockExpiry'] = 0;
-                            _config['enforceShortsBlock'] = true;
-                            _saveConfig();
-                          },
-                          icon: const Icon(Icons.lock, size: 18),
-                          label: const Text('Lock Shorts Immediately (No Password)'),
-                        )
-                      : OutlinedButton.icon(
-                          onPressed: () async {
-                            final ok = await _verifyPasswordDialog(
-                              slotKey: 'shorts',
-                              title: 'Unlock YouTube Shorts',
-                              subtitle: 'Requires Password #2 (Shorts Vault Password).',
-                            );
-                            if (!ok) return;
-                            final mins = await _selectDurationDialog(
-                              title: 'Unlock Shorts Duration',
-                              minutesOptions: [10, 20, 30, 60],
-                            );
-                            if (mins != null) {
-                              _config['shortsUnlockExpiry'] = _now + (mins * 60 * 1000);
-                              await _saveConfig();
-                            }
-                          },
-                          icon: const Icon(Icons.lock_open, size: 18),
-                          label: const Text('Temporarily Unlock Shorts (Password #2)'),
-                        ),
-                ),
-              ],
-            ),
-          ),
-        ),
-
-        // Active Profile & Emergency 1-Video Pass Card
-        Card(
-          child: Padding(
-            padding: const EdgeInsets.all(16),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text(
-                  'Active Group: ${activeGroup['name']}',
-                  style: const TextStyle(fontWeight: FontWeight.w700, fontSize: 15),
-                ),
-                const SizedBox(height: 4),
-                Text(
-                  'Whitelisted Channels: ${(activeGroup['channels'] as List).length}  •  Interest Topics: ${(activeGroup['interests'] as List).length}',
-                  style: const TextStyle(fontSize: 12, color: Color(0xFF475569)),
-                ),
-                const Divider(height: 24, color: Color(0xFFE2E8F0)),
-                Row(
-                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                  children: [
-                    const Expanded(
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          Text(
-                            'Emergency Single-Video Pass (15 Min)',
-                            style: TextStyle(fontWeight: FontWeight.w600, fontSize: 13),
-                          ),
-                          SizedBox(height: 2),
-                          Text(
-                            'Allows watching an educational/troubleshooting video from a non-whitelisted channel for 15 minutes (Shorts & blacklisted words remain blocked).',
-                            style: TextStyle(fontSize: 11, color: Color(0xFF64748B)),
-                          ),
-                        ],
-                      ),
-                    ),
-                    const SizedBox(width: 12),
-                    _isEmergencyPassActive
-                        ? FilledButton(
-                            onPressed: () {
-                              _config['emergencyPassExpiry'] = 0;
-                              _saveConfig();
-                            },
-                            child: Text(
-                              'Lock (${_formatRemaining(_config['emergencyPassExpiry'] as int)})',
-                            ),
-                          )
-                        : OutlinedButton(
-                            onPressed: () async {
-                              final ok = await _verifyPasswordDialog(
-                                slotKey: 'interest',
-                                title: 'Activate 15-Min Video Pass',
-                                subtitle: 'Requires Password #5 (Interest / Pass Password).',
-                              );
-                              if (ok) {
-                                _config['emergencyPassExpiry'] = _now + (15 * 60 * 1000);
-                                await _saveConfig();
-                              }
-                            },
-                            child: const Text('15m Pass'),
-                          ),
-                  ],
-                ),
-              ],
-            ),
-          ),
-        ),
-
-        // Settings Tamper Shield Card
-        Card(
-          child: SwitchListTile(
-            title: const Text(
-              'Settings & App Info Tamper Shield',
-              style: TextStyle(fontWeight: FontWeight.w700, fontSize: 14),
-            ),
-            subtitle: const Text(
-              'Blocks Force Stop, Clear Data, and Uninstall screens for YouTube and YT Guard in Android Settings.',
-              style: TextStyle(fontSize: 12, color: Color(0xFF475569)),
-            ),
-            value: _config['tamperProtection'] as bool? ?? true,
-            activeColor: const Color(0xFF0F172A),
-            onChanged: (val) async {
-              if (val) {
-                // Turning lock ON requires no password
-                _config['tamperProtection'] = true;
-                await _saveConfig();
-              } else {
-                final ok = await _verifyPasswordDialog(
-                  slotKey: 'admin',
-                  title: 'Disable Tamper Shield',
-                  subtitle: 'Requires Password #3 (Admin Password).',
-                );
-                if (ok) {
-                  _config['tamperProtection'] = false;
-                  await _saveConfig();
-                }
-              }
-            },
-          ),
-        ),
-      ],
-    );
-  }
-
-  // ===========================================================================
-  // TAB 2: GROUPS, WHITELIST & CONTENT FILTERS
-  // ===========================================================================
-  Widget _buildGroupsAndWhitelistTab() {
-    final groups = List>.from(
-      (_config['groups'] as List).map((e) => Map<String, dynamic>.from(e as Map)),
-    );
-    final activeGroup = _getActiveGroup();
-    final channels = List<String>.from(activeGroup['channels'] as List);
-    final interests = List<String>.from(activeGroup['interests'] as List);
-    final blockedKeywords = List<String>.from(_config['blockedTitleKeywords'] as List);
-
-    return ListView(
-      padding: const EdgeInsets.all(16),
-      children: [
-        // Group Switcher Card
-        Card(
-          child: Padding(
-            padding: const EdgeInsets.all(16),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Row(
-                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                  children: [
-                    const Text(
-                      'Active Study / Focus Group',
-                      style: TextStyle(fontWeight: FontWeight.w700, fontSize: 15),
-                    ),
-                    TextButton.icon(
-                      onPressed: _createNewGroupDialog,
-                      icon: const Icon(Icons.add, size: 16),
-                      label: const Text('New Group (Pwd #3)'),
-                    ),
-                  ],
-                ),
-                const SizedBox(height: 8),
-                Wrap(
-                  spacing: 8,
-                  runSpacing: 8,
-                  children: groups.map((g) {
-                    final isSelected = g['id'] == activeGroup['id'];
-                    return ChoiceChip(
-                      label: Text(g['name'].toString()),
-                      selected: isSelected,
-                      onSelected: (selected) async {
-                        if (!selected || isSelected) return;
-                        final ok = await _verifyPasswordDialog(
-                          slotKey: 'switchGroup',
-                          title: 'Switch Active Group',
-                          subtitle: 'Requires Password #4 (Group Switch Password).',
-                        );
-                        if (ok) {
-                          _config['activeGroupId'] = g['id'];
-                          await _saveConfig();
-                        }
-                      },
-                    );
-                  }).toList(),
-                ),
-              ],
-            ),
-          ),
-        ),
-
-        // Enforcement Rules Card
-        Card(
-          child: Column(
-            children: [
-              SwitchListTile(
-                title: const Text(
-                  'Enforce Channel Whitelist',
-                  style: TextStyle(fontWeight: FontWeight.w700, fontSize: 14),
-                ),
-                subtitle: const Text(
-                  'Only channels listed in the active group are allowed to play videos.',
-                  style: TextStyle(fontSize: 12),
-                ),
-                value: _config['enforceWhitelist'] as bool? ?? true,
-                onChanged: (val) async {
-                  if (val) {
-                    _config['enforceWhitelist'] = true;
-                    await _saveConfig();
-                  } else {
-                    final ok = await _verifyPasswordDialog(
-                      slotKey: 'admin',
-                      title: 'Disable Channel Whitelist',
-                      subtitle: 'Requires Password #3 (Group Admin Password).',
-                    );
-                    if (ok) {
-                      _config['enforceWhitelist'] = false;
-                      await _saveConfig();
-                    }
-                  }
-                },
-              ),
-              const Divider(height: 1, color: Color(0xFFE2E8F0)),
-              SwitchListTile(
-                title: const Text(
-                  'Enforce Interest / Topic Keywords',
-                  style: TextStyle(fontWeight: FontWeight.w700, fontSize: 14),
-                ),
-                subtitle: const Text(
-                  'Requires video screen text to match at least one interest topic of the active group.',
-                  style: TextStyle(fontSize: 12),
-                ),
-                value: _config['enforceInterestFilter'] as bool? ?? false,
-                onChanged: (val) async {
-                  if (val) {
-                    _config['enforceInterestFilter'] = true;
-                    await _saveConfig();
-                  } else {
-                    final ok = await _verifyPasswordDialog(
-                      slotKey: 'interest',
-                      title: 'Disable Interest Topic Filter',
-                      subtitle: 'Requires Password #5 (Interest Filter Password).',
-                    );
-                    if (ok) {
-                      _config['enforceInterestFilter'] = false;
-                      await _saveConfig();
-                    }
-                  }
-                },
-              ),
-              const Divider(height: 1, color: Color(0xFFE2E8F0)),
-              SwitchListTile(
-                title: const Text(
-                  'Enforce Title Keyword Blacklist',
-                  style: TextStyle(fontWeight: FontWeight.w700, fontSize: 14),
-                ),
-                subtitle: const Text(
-                  'Blocks videos containing distracting words (e.g. vlog, roast) even on whitelisted channels.',
-                  style: TextStyle(fontSize: 12),
-                ),
-                value: _config['enforceTitleBlacklist'] as bool? ?? true,
-                onChanged: (val) async {
-                  if (val) {
-                    _config['enforceTitleBlacklist'] = true;
-                    await _saveConfig();
-                  } else {
-                    final ok = await _verifyPasswordDialog(
-                      slotKey: 'admin',
-                      title: 'Disable Keyword Blacklist',
-                      subtitle: 'Requires Password #3 (Group Admin Password).',
-                    );
-                    if (ok) {
-                      _config['enforceTitleBlacklist'] = false;
-                      await _saveConfig();
-                    }
-                  }
-                },
-              ),
-            ],
-          ),
-        ),
-
-        // Whitelisted Channels Editor
-        _buildEditableChipSection(
-          title: 'Whitelisted Channels (${activeGroup['name']})',
-          subtitle: 'Exact or partial YouTube channel names allowed in this group.',
-          items: channels,
-          addPasswordSlot: 'admin',
-          removePasswordSlot: 'admin',
-          onAdd: (val) {
-            channels.add(val);
-            _updateActiveGroupField('channels', channels);
-          },
-          onRemove: (val) {
-            channels.remove(val);
-            _updateActiveGroupField('channels', channels);
-          },
-        ),
-
-        // Allowed Interest Keywords Editor
-        _buildEditableChipSection(
-          title: 'Allowed Interest Topics (${activeGroup['name']})',
-          subtitle: 'Topic keywords allowed when Interest Filter is ON.',
-          items: interests,
-          addPasswordSlot: 'interest',
-          removePasswordSlot: 'interest',
-          onAdd: (val) {
-            interests.add(val);
-            _updateActiveGroupField('interests', interests);
-          },
-          onRemove: (val) {
-            interests.remove(val);
-            _updateActiveGroupField('interests', interests);
-          },
-        ),
-
-        // Blocked Title Keywords Editor (One-Way Add: adding blocked word needs no password!)
-        _buildEditableChipSection(
-          title: 'Blocked Title Keywords (Global)',
-          subtitle: 'Adding a blocked keyword requires NO password. Removing requires Admin Password (#3).',
-          items: blockedKeywords,
-          addPasswordSlot: null, // Free to add stricter rules anytime
-          removePasswordSlot: 'admin',
-          onAdd: (val) {
-            blockedKeywords.add(val.toLowerCase());
-            _config['blockedTitleKeywords'] = blockedKeywords;
-            _saveConfig();
-          },
-          onRemove: (val) {
-            blockedKeywords.remove(val);
-            _config['blockedTitleKeywords'] = blockedKeywords;
-            _saveConfig();
-          },
-        ),
-      ],
-    );
-  }
-
-  void _updateActiveGroupField(String key, List<String> updated) {
-    final groups = List>.from(
-      (_config['groups'] as List).map((e) => Map<String, dynamic>.from(e as Map)),
-    );
-    final activeId = _config['activeGroupId'] as String? ?? 'study';
-    for (int i = 0; i < groups.length; i++) {
-      if (groups[i]['id'] == activeId) {
-        groups[i][key] = updated;
-        break;
-      }
-    }
-    _config['groups'] = groups;
-    _saveConfig();
-  }
-
-  Future<void> _createNewGroupDialog() async {
-    final ok = await _verifyPasswordDialog(
-      slotKey: 'admin',
-      title: 'Create New Group',
-      subtitle: 'Requires Password #3 (Group Admin Password).',
-    );
-    if (!ok) return;
-
-    final controller = TextEditingController();
-    final name = await showDialog<String>(
+    await showDialog(
       context: context,
       builder: (ctx) => AlertDialog(
-        title: const Text('New Group Name', style: TextStyle(fontSize: 16, fontWeight: FontWeight.w700)),
+        title: Text(title),
         content: TextField(
-          controller: controller,
+          controller: ctrl,
+          obscureText: true,
           autofocus: true,
           decoration: const InputDecoration(
-            hintText: 'e.g. Revision / Exam Prep',
+            labelText: 'Password dalein',
             border: OutlineInputBorder(),
           ),
         ),
         actions: [
           TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Cancel')),
           FilledButton(
-            onPressed: () => Navigator.pop(ctx, controller.text.trim()),
-            child: const Text('Create'),
+            onPressed: () {
+              if (ctrl.text.trim() == expected) {
+                ok = true;
+                Navigator.pop(ctx);
+              } else {
+                ScaffoldMessenger.of(context).showSnackBar(
+                  const SnackBar(content: Text('Galat password!')),
+                );
+              }
+            },
+            child: const Text('Verify'),
           ),
         ],
       ),
     );
+    return ok;
+  }
 
-    if (name != null && name.isNotEmpty) {
-      final groups = List>.from(
-        (_config['groups'] as List).map((e) => Map<String, dynamic>.from(e as Map)),
-      );
-      final newId = 'group_${DateTime.now().millisecondsSinceEpoch}';
-      groups.add({
-        'id': newId,
-        'name': name,
-        'channels': <String>[],
-        'interests': <String>[],
-      });
-      _config['groups'] = groups;
-      _config['activeGroupId'] = newId;
-      await _saveConfig();
+  Future<void> _toggleFeatureWithPassword({
+    required String configKey,
+    required String slotKey,
+    required String featureName,
+    required bool newValue,
+  }) async {
+    final actionText = newValue ? 'ON' : 'OFF';
+    final verified = await _verifySlotPassword(
+      slotKey,
+      '$featureName $actionText karein',
+    );
+    if (verified) {
+      _cfg[configKey] = newValue;
+      await _save();
     }
   }
 
-  Widget _buildEditableChipSection({
-    required String title,
-    required String subtitle,
-    required List<String> items,
-    required String? addPasswordSlot,
-    required String removePasswordSlot,
-    required void Function(String) onAdd,
-    required void Function(String) onRemove,
-  }) {
-    return Card(
-      child: Padding(
-        padding: const EdgeInsets.all(16),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Row(
-              mainAxisAlignment: MainAxisAlignment.spaceBetween,
-              children: [
-                Expanded(
-                  child: Text(
-                    title,
-                    style: const TextStyle(fontWeight: FontWeight.w700, fontSize: 14),
-                  ),
-                ),
-                OutlinedButton.icon(
-                  onPressed: () async {
-                    if (addPasswordSlot != null) {
-                      final ok = await _verifyPasswordDialog(
-                        slotKey: addPasswordSlot,
-                        title: 'Authenticate to Add Item',
-                        subtitle: 'Enter the assigned slot password to modify this list.',
-                      );
-                      if (!ok) return;
-                    }
-                    final ctrl = TextEditingController();
-                    if (!mounted) return;
-                    final val = await showDialog<String>(
-                      context: context,
-                      builder: (ctx) => AlertDialog(
-                        title: Text(title, style: const TextStyle(fontSize: 15, fontWeight: FontWeight.w700)),
-                        content: TextField(
-                          controller: ctrl,
-                          autofocus: true,
-                          decoration: const InputDecoration(
-                            hintText: 'Enter channel or keyword',
-                            border: OutlineInputBorder(),
-                          ),
-                        ),
-                        actions: [
-                          TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Cancel')),
-                          FilledButton(
-                            onPressed: () => Navigator.pop(ctx, ctrl.text.trim()),
-                            child: const Text('Add'),
-                          ),
-                        ],
-                      ),
-                    );
-                    if (val != null && val.isNotEmpty) {
-                      onAdd(val);
-                    }
-                  },
-                  icon: const Icon(Icons.add, size: 16),
-                  label: const Text('Add'),
-                ),
-              ],
-            ),
-            const SizedBox(height: 4),
-            Text(subtitle, style: const TextStyle(fontSize: 12, color: Color(0xFF64748B))),
-            const SizedBox(height: 12),
-            items.isEmpty
-                ? const Text('No items added yet.', style: TextStyle(fontSize: 12, color: Color(0xFF94A3B8)))
-                : Wrap(
-                    spacing: 8,
-                    runSpacing: 8,
-                    children: items.map((item) {
-                      return InputChip(
-                        label: Text(item, style: const TextStyle(fontSize: 12)),
-                        onDeleted: () async {
-                          final ok = await _verifyPasswordDialog(
-                            slotKey: removePasswordSlot,
-                            title: 'Remove "$item"',
-                            subtitle: 'Requires slot password to remove this item.',
-                          );
-                          if (ok) {
-                            onRemove(item);
-                          }
-                        },
-                      );
-                    }).toList(),
-                  ),
-          ],
-        ),
+  @override
+  Widget build(BuildContext context) {
+    final pages = [
+      _buildControlsTab(),
+      _buildAppBlockerTab(),
+      _buildYoutubeAndPasswordsTab(),
+    ];
+
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('YT Guard'),
+        actions: [
+          IconButton(
+            tooltip: 'Lock Dashboard',
+            icon: const Icon(Icons.lock_outline),
+            onPressed: () {
+              Navigator.of(context).pushReplacement(
+                MaterialPageRoute(builder: (_) => const MasterGateScreen()),
+              );
+            },
+          ),
+        ],
+      ),
+      body: pages[_tabIndex],
+      bottomNavigationBar: NavigationBar(
+        selectedIndex: _tabIndex,
+        onDestinationSelected: (i) => setState(() => _tabIndex = i),
+        destinations: const [
+          NavigationDestination(icon: Icon(Icons.tune), label: 'Controls'),
+          NavigationDestination(icon: Icon(Icons.apps_outlined), label: 'App Lock'),
+          NavigationDestination(icon: Icon(Icons.vpn_key_outlined), label: 'YT & Passwords'),
+        ],
       ),
     );
   }
 
-  // ===========================================================================
-  // TAB 3: 5-PASSWORD MATRIX  (INDEPENDENT VAULT SLOTS) Rajput 
-  // ===========================================================================
-  Widget _buildPasswordMatrixTab() {
-    final slots = [
-      {
-        'key': 'family',
-        'title': 'Password #1: Family Mode Unlock',
-        'desc': 'Unlocks full YouTube for family members with auto-lock timer. Default: 1111',
-      },
-      {
-        'key': 'shorts',
-        'title': 'Password #2: YouTube Shorts Vault',
-        'desc': 'Required only when you want to unlock YouTube Shorts. Store this in your longest Time Vault. Default: 2222',
-      },
-      {
-        'key': 'admin',
-        'title': 'Password #3: Group & Whitelist Admin',
-        'desc': 'Required to edit whitelisted channels, disable Tamper Shield, or remove blocked keywords. Default: 3333',
-      },
-      {
-        'key': 'switchGroup',
-        'title': 'Password #4: Group Switcher',
-        'desc': 'Required to switch between active groups (e.g. Study Group to Coding Group). Default: 4444',
-      },
-      {
-        'key': 'interest',
-        'title': 'Password #5: Interest Filter & 15m Pass',
-        'desc': 'Controls Home/Topic interest keywords and the 15-minute Single-Video Emergency Pass. Default: 5555',
-      },
-    ];
+  // --------------------------------------------------------------------------
+  // TAB 1: FEATURE TOGGLES (ALL DEFAULT OFF, PASSWORD FOR BOTH ON & OFF)
+  // --------------------------------------------------------------------------
+  Widget _buildControlsTab() {
+    return ListView(
+      padding: const EdgeInsets.all(16),
+      children: [
+        Container(
+          padding: const EdgeInsets.all(16),
+          decoration: BoxDecoration(
+            borderRadius: BorderRadius.circular(14),
+            border: Border.all(
+              color: _a11yEnabled ? Colors.green : Colors.orange,
+            ),
+          ),
+          child: Row(
+            children: [
+              Icon(
+                _a11yEnabled ? Icons.check_circle : Icons.warning_amber_rounded,
+                color: _a11yEnabled ? Colors.green : Colors.orange,
+              ),
+              const SizedBox(width: 12),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      _a11yEnabled
+                          ? 'Accessibility Service Active'
+                          : 'Accessibility Permission Chahiye',
+                      style: const TextStyle(fontWeight: FontWeight.bold),
+                    ),
+                    const Text(
+                      'Permission dene par kuch bhi apne-aap ON nahi hota. Niche se password daal kar ON karein.',
+                      style: TextStyle(fontSize: 12),
+                    ),
+                  ],
+                ),
+              ),
+              if (!_a11yEnabled)
+                FilledButton(
+                  onPressed: GuardBridge.openAccessibilitySettings,
+                  child: const Text('Enable'),
+                ),
+            ],
+          ),
+        ),
+        const SizedBox(height: 16),
+        _featureSwitchTile(
+          title: 'YouTube Shorts Blocker',
+          subtitle: 'Shorts khulne par full-screen pop-up dikhayega (No auto-back)',
+          value: _cfg['shortsBlockEnabled'] == true,
+          onChanged: (v) => _toggleFeatureWithPassword(
+            configKey: 'shortsBlockEnabled',
+            slotKey: 'shorts',
+            featureName: 'Shorts Blocker',
+            newValue: v,
+          ),
+        ),
+        _featureSwitchTile(
+          title: 'YouTube Category / Channel Filter',
+          subtitle: 'Sirf active category ke channels chalenge, baaki par pop-up aayega',
+          value: _cfg['ytWhitelistEnabled'] == true,
+          onChanged: (v) => _toggleFeatureWithPassword(
+            configKey: 'ytWhitelistEnabled',
+            slotKey: 'ytAdmin',
+            featureName: 'Category Filter',
+            newValue: v,
+          ),
+        ),
+        _featureSwitchTile(
+          title: 'YouTube Keyword Blacklist',
+          subtitle: 'Blocked shabd wali video chalne par pop-up aayega',
+          value: _cfg['ytBlacklistEnabled'] == true,
+          onChanged: (v) => _toggleFeatureWithPassword(
+            configKey: 'ytBlacklistEnabled',
+            slotKey: 'ytAdmin',
+            featureName: 'Keyword Blacklist',
+            newValue: v,
+          ),
+        ),
+        _featureSwitchTile(
+          title: 'Settings Tamper Shield',
+          subtitle: 'Uninstall, Clear Data aur Accessibility page par pop-up lock',
+          value: _cfg['tamperShieldEnabled'] == true,
+          onChanged: (v) => _toggleFeatureWithPassword(
+            configKey: 'tamperShieldEnabled',
+            slotKey: 'tamper',
+            featureName: 'Settings Tamper Shield',
+            newValue: v,
+          ),
+        ),
+        _featureSwitchTile(
+          title: 'Custom App & Category Blocker',
+          subtitle: 'Select kiye gaye apps/categories par alag password lock lagayega',
+          value: _cfg['appBlockerEnabled'] == true,
+          onChanged: (v) => _toggleFeatureWithPassword(
+            configKey: 'appBlockerEnabled',
+            slotKey: 'appBlocker',
+            featureName: 'Custom App Blocker',
+            newValue: v,
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _featureSwitchTile({
+    required String title,
+    required String subtitle,
+    required bool value,
+    required ValueChanged<bool> onChanged,
+  }) {
+    return Container(
+      margin: const EdgeInsets.only(bottom: 10),
+      decoration: BoxDecoration(
+        borderRadius: BorderRadius.circular(14),
+        border: Border.all(color: Theme.of(context).dividerColor),
+      ),
+      child: SwitchListTile(
+        title: Text(title, style: const TextStyle(fontWeight: FontWeight.w600)),
+        subtitle: Text(subtitle, style: const TextStyle(fontSize: 12)),
+        value: value,
+        onChanged: onChanged,
+      ),
+    );
+  }
+
+  // --------------------------------------------------------------------------
+  // TAB 2: CUSTOM APP BLOCKER (INDIVIDUAL PASSWORD OR CATEGORY PASSWORD)
+  // --------------------------------------------------------------------------
+  Widget _buildAppBlockerTab() {
+    final categories = List>.from(
+      (_cfg['appCategories'] as List).map((e) => Map<String, dynamic>.from(e)),
+    );
+    final individuals = List>.from(
+      (_cfg['individualLockedApps'] as List).map((e) => Map<String, dynamic>.from(e)),
+    );
 
     return ListView(
       padding: const EdgeInsets.all(16),
       children: [
-        const Card(
-          color: Color(0xFFF1F5F9),
-          child: Padding(
-            padding: EdgeInsets.all(14),
-            child: Text(
-              'Zero-Bypass Isolation: Each security layer has its own independent password. Changing any password requires entering that specific slot\'s current password first—so knowing one password never compromises the others.',
-              style: TextStyle(fontSize: 12, color: Color(0xFF334155), height: 1.4),
+        Row(
+          children: [
+            Expanded(
+              child: FilledButton.icon(
+                icon: const Icon(Icons.create_new_folder_outlined),
+                label: const Text('Nayi Category'),
+                onPressed: _createAppCategoryDialog,
+              ),
             ),
-          ),
+            const SizedBox(width: 10),
+            Expanded(
+              child: OutlinedButton.icon(
+                icon: const Icon(Icons.add_moderator_outlined),
+                label: const Text('Lock Single App'),
+                onPressed: _lockIndividualAppDialog,
+              ),
+            ),
+          ],
         ),
-        ...slots.map((slot) {
-          final slotKey = slot['key']!;
-          return Card(
-            child: ListTile(
-              contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-              title: Text(
-                slot['title']!,
-                style: const TextStyle(fontWeight: FontWeight.w700, fontSize: 14),
-              ),
-              subtitle: Padding(
-                padding: const EdgeInsets.only(top: 4),
-                child: Text(
-                  slot['desc']!,
-                  style: const TextStyle(fontSize: 12, color: Color(0xFF475569)),
+        const SizedBox(height: 20),
+        const Text('App Categories (Har Category Ka Alag Password)',
+            style: TextStyle(fontWeight: FontWeight.bold, fontSize: 15)),
+        const SizedBox(height: 8),
+        if (categories.isEmpty)
+          const Padding(
+            padding: EdgeInsets.symmetric(vertical: 8),
+            child: Text('Abhi koi app category nahi bani hai.'),
+          ),
+        ...categories.asMap().entries.map((entry) {
+          final idx = entry.key;
+          final cat = entry.value;
+          final pkgs = List<String>.from(cat['packages'] ?? []);
+          return Container(
+            margin: const EdgeInsets.only(bottom: 10),
+            padding: const EdgeInsets.all(12),
+            decoration: BoxDecoration(
+              borderRadius: BorderRadius.circular(12),
+              border: Border.all(color: Theme.of(context).dividerColor),
+            ),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Row(
+                  children: [
+                    Expanded(
+                      child: Text(
+                        '${cat['name']} (${pkgs.length} apps)',
+                        style: const TextStyle(fontWeight: FontWeight.bold),
+                      ),
+                    ),
+                    TextButton(
+                      onPressed: () => _assignAppsToCategory(idx),
+                      child: const Text('Apps Chunein'),
+                    ),
+                    IconButton(
+                      icon: const Icon(Icons.delete_outline, size: 20),
+                      onPressed: () async {
+                        if (await _verifySlotPassword('appBlocker', 'Category Hatayein')) {
+                          (_cfg['appCategories'] as List).removeAt(idx);
+                          await _save();
+                        }
+                      },
+                    ),
+                  ],
                 ),
-              ),
-              trailing: OutlinedButton(
-                onPressed: () => _changeSlotPasswordDialog(slotKey, slot['title']!),
-                child: const Text('Change'),
-              ),
+                if (pkgs.isNotEmpty)
+                  Text(
+                    pkgs.map(_appNameForPackage).join(', '),
+                    style: const TextStyle(fontSize: 12),
+                  ),
+              ],
+            ),
+          );
+        }),
+        const SizedBox(height: 20),
+        const Text('Individual Locked Apps (Har App Ka Alag Password)',
+            style: TextStyle(fontWeight: FontWeight.bold, fontSize: 15)),
+        const SizedBox(height: 8),
+        if (individuals.isEmpty)
+          const Padding(
+            padding: EdgeInsets.symmetric(vertical: 8),
+            child: Text('Abhi koi individual app lock nahi hai.'),
+          ),
+        ...individuals.asMap().entries.map((entry) {
+          final idx = entry.key;
+          final app = entry.value;
+          return ListTile(
+            contentPadding: EdgeInsets.zero,
+            leading: const Icon(Icons.lock),
+            title: Text(app['appName'] ?? app['packageName'] ?? ''),
+            subtitle: Text(app['packageName'] ?? ''),
+            trailing: IconButton(
+              icon: const Icon(Icons.delete_outline),
+              onPressed: () async {
+                final expected = (app['password'] ?? '5555').toString();
+                final ctrl = TextEditingController();
+                await showDialog(
+                  context: context,
+                  builder: (ctx) => AlertDialog(
+                    title: Text('${app['appName']} Lock Hatayein'),
+                    content: TextField(
+                      controller: ctrl,
+                      obscureText: true,
+                      decoration: const InputDecoration(
+                        labelText: 'Is app ka password dalein',
+                        border: OutlineInputBorder(),
+                      ),
+                    ),
+                    actions: [
+                      TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Cancel')),
+                      FilledButton(
+                        onPressed: () async {
+                          if (ctrl.text.trim() == expected) {
+                            (_cfg['individualLockedApps'] as List).removeAt(idx);
+                            await _save();
+                            if (ctx.mounted) Navigator.pop(ctx);
+                          }
+                        },
+                        child: const Text('Remove'),
+                      ),
+                    ],
+                  ),
+                );
+              },
             ),
           );
         }),
@@ -1172,84 +635,398 @@ class _MainDashboardState extends State<MainDashboard> with WidgetsBindingObserv
     );
   }
 
-  Future<void> _changeSlotPasswordDialog(String slotKey, String slotTitle) async {
-    final verified = await _verifyPasswordDialog(
-      slotKey: slotKey,
-      title: 'Verify Current Password',
-      subtitle: 'Enter current password for [$slotTitle] before setting a new one.',
-    );
-    if (!verified || !mounted) return;
+  String _appNameForPackage(String pkg) {
+    for (final a in _installedApps) {
+      if (a['packageName'] == pkg) return a['appName'] ?? pkg;
+    }
+    return pkg;
+  }
 
-    final newPassCtrl = TextEditingController();
-    final confirmCtrl = TextEditingController();
-    String? err;
-
-    await showDialog<void>(
+  Future<void> _createAppCategoryDialog() async {
+    final nameCtrl = TextEditingController();
+    final pwdCtrl = TextEditingController();
+    await showDialog(
       context: context,
-      barrierDismissible: false,
-      builder: (ctx) {
-        return StatefulBuilder(
-          builder: (ctx, setDialogState) {
-            return AlertDialog(
-              title: Text(
-                'Set New $slotTitle',
-                style: const TextStyle(fontSize: 15, fontWeight: FontWeight.w700),
-              ),
-              content: Column(
-                mainAxisSize: MainAxisSize.min,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Nayi App Category Banayein'),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            TextField(
+              controller: nameCtrl,
+              decoration: const InputDecoration(labelText: 'Category Name (e.g. Social Media)'),
+            ),
+            const SizedBox(height: 12),
+            TextField(
+              controller: pwdCtrl,
+              obscureText: true,
+              decoration: const InputDecoration(labelText: 'Is Category Ka Alag Password'),
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Cancel')),
+          FilledButton(
+            onPressed: () async {
+              final name = nameCtrl.text.trim();
+              final pwd = pwdCtrl.text.trim();
+              if (name.isNotEmpty && pwd.length >= 4) {
+                (_cfg['appCategories'] as List).add({
+                  'id': 'cat_${DateTime.now().millisecondsSinceEpoch}',
+                  'name': name,
+                  'password': pwd,
+                  'packages': <String>[],
+                });
+                await _save();
+                if (ctx.mounted) Navigator.pop(ctx);
+              }
+            },
+            child: const Text('Save'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Future<void> _assignAppsToCategory(int catIndex) async {
+    final cat = Map<String, dynamic>.from((_cfg['appCategories'] as List)[catIndex]);
+    final selected = Set<String>.from(cat['packages'] ?? []);
+    String query = '';
+
+    await showDialog(
+      context: context,
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setModalState) {
+          final filtered = _installedApps.where((a) {
+            final n = (a['appName'] ?? '').toLowerCase();
+            return query.isEmpty || n.contains(query.toLowerCase());
+          }).toList();
+
+          return AlertDialog(
+            title: Text('${cat['name']} Apps'),
+            content: SizedBox(
+              width: double.maxFinite,
+              height: 400,
+              child: Column(
                 children: [
                   TextField(
-                    controller: newPassCtrl,
-                    obscureText: true,
                     decoration: const InputDecoration(
-                      labelText: 'New Password (min 4 chars)',
-                      border: OutlineInputBorder(),
-                      isDense: true,
+                      hintText: 'App search karein...',
+                      prefixIcon: Icon(Icons.search),
                     ),
+                    onChanged: (v) => setModalState(() => query = v),
                   ),
-                  const SizedBox(height: 12),
-                  TextField(
-                    controller: confirmCtrl,
-                    obscureText: true,
-                    decoration: InputDecoration(
-                      labelText: 'Confirm New Password',
-                      errorText: err,
-                      border: const OutlineInputBorder(),
-                      isDense: true,
+                  const SizedBox(height: 8),
+                  Expanded(
+                    child: ListView.builder(
+                      itemCount: filtered.length,
+                      itemBuilder: (_, i) {
+                        final app = filtered[i];
+                        final pkg = app['packageName']!;
+                        return CheckboxListTile(
+                          title: Text(app['appName'] ?? pkg),
+                          subtitle: Text(pkg, style: const TextStyle(fontSize: 11)),
+                          value: selected.contains(pkg),
+                          onChanged: (checked) {
+                            setModalState(() {
+                              if (checked == true) {
+                                selected.add(pkg);
+                              } else {
+                                selected.remove(pkg);
+                              }
+                            });
+                          },
+                        );
+                      },
                     ),
                   ),
                 ],
               ),
-              actions: [
-                TextButton(
-                  onPressed: () => Navigator.pop(ctx),
-                  child: const Text('Cancel'),
-                ),
-                FilledButton(
-                  onPressed: () {
-                    final p1 = newPassCtrl.text.trim();
-                    final p2 = confirmCtrl.text.trim();
-                    if (p1.length < 4) {
-                      setDialogState(() => err = 'Minimum 4 characters required');
-                      return;
-                    }
-                    if (p1 != p2) {
-                      setDialogState(() => err = 'Passwords do not match');
-                      return;
-                    }
-                    final passwords = Map<String, dynamic>.from(_config['passwords'] as Map);
-                    passwords[slotKey] = p1;
-                    _config['passwords'] = passwords;
-                    _saveConfig();
-                    Navigator.pop(ctx);
-                  },
-                  child: const Text('Save Password'),
-                ),
-              ],
-            );
-          },
+            ),
+            actions: [
+              TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Cancel')),
+              FilledButton(
+                onPressed: () async {
+                  cat['packages'] = selected.toList();
+                  (_cfg['appCategories'] as List)[catIndex] = cat;
+                  await _save();
+                  if (ctx.mounted) Navigator.pop(ctx);
+                },
+                child: const Text('Save'),
+              ),
+            ],
+          );
+        },
+      ),
+    );
+  }
+
+  Future<void> _lockIndividualAppDialog() async {
+    String query = '';
+    Map<String, String>? pickedApp;
+    final pwdCtrl = TextEditingController();
+
+    await showDialog(
+      context: context,
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setModalState) {
+          final filtered = _installedApps.where((a) {
+            final n = (a['appName'] ?? '').toLowerCase();
+            return query.isEmpty || n.contains(query.toLowerCase());
+          }).toList();
+
+          return AlertDialog(
+            title: const Text('Single App Lock Karein'),
+            content: SizedBox(
+              width: double.maxFinite,
+              height: 420,
+              child: Column(
+                children: [
+                  TextField(
+                    decoration: const InputDecoration(
+                      hintText: 'App search karein...',
+                      prefixIcon: Icon(Icons.search),
+                    ),
+                    onChanged: (v) => setModalState(() => query = v),
+                  ),
+                  const SizedBox(height: 8),
+                  Expanded(
+                    child: ListView.builder(
+                      itemCount: filtered.length,
+                      itemBuilder: (_, i) {
+                        final app = filtered[i];
+                        final isSel = pickedApp?['packageName'] == app['packageName'];
+                        return ListTile(
+                          selected: isSel,
+                          title: Text(app['appName'] ?? ''),
+                          trailing: isSel ? const Icon(Icons.check_circle) : null,
+                          onTap: () => setModalState(() => pickedApp = app),
+                        );
+                      },
+                    ),
+                  ),
+                  const SizedBox(height: 8),
+                  TextField(
+                    controller: pwdCtrl,
+                    obscureText: true,
+                    decoration: const InputDecoration(
+                      labelText: 'Is App Ka Alag Password (min 4)',
+                      border: OutlineInputBorder(),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            actions: [
+              TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Cancel')),
+              FilledButton(
+                onPressed: () async {
+                  final pwd = pwdCtrl.text.trim();
+                  if (pickedApp != null && pwd.length >= 4) {
+                    final list = _cfg['individualLockedApps'] as List;
+                    list.removeWhere((e) => e['packageName'] == pickedApp!['packageName']);
+                    list.add({
+                      'packageName': pickedApp!['packageName'],
+                      'appName': pickedApp!['appName'],
+                      'password': pwd,
+                    });
+                    await _save();
+                    if (ctx.mounted) Navigator.pop(ctx);
+                  }
+                },
+                child: const Text('Lock App'),
+              ),
+            ],
+          );
+        },
+      ),
+    );
+  }
+
+  // --------------------------------------------------------------------------
+  // TAB 3: YOUTUBE CATEGORIES, KEYWORDS & PASSWORDS
+  // --------------------------------------------------------------------------
+  Widget _buildYoutubeAndPasswordsTab() {
+    final groups = List>.from(
+      (_cfg['groups'] as List).map((e) => Map<String, dynamic>.from(e)),
+    );
+    final activeId = _cfg['activeGroupId'] ?? 'study';
+    final keywords = List<String>.from(_cfg['blockedTitleKeywords'] ?? []);
+
+    return ListView(
+      padding: const EdgeInsets.all(16),
+      children: [
+        const Text('YouTube Active Category (Whitelist)',
+            style: TextStyle(fontWeight: FontWeight.bold, fontSize: 15)),
+        const SizedBox(height: 8),
+        ...groups.asMap().entries.map((entry) {
+          final idx = entry.key;
+          final g = entry.value;
+          final isSelected = g['id'] == activeId;
+          final chs = List<String>.from(g['channels'] ?? []);
+          return Container(
+            margin: const EdgeInsets.only(bottom: 10),
+            decoration: BoxDecoration(
+              borderRadius: BorderRadius.circular(12),
+              border: Border.all(
+                color: isSelected
+                    ? Theme.of(context).colorScheme.primary
+                    : Theme.of(context).dividerColor,
+              ),
+            ),
+            child: ListTile(
+              title: Text(g['name'] ?? '', style: const TextStyle(fontWeight: FontWeight.w600)),
+              subtitle: Text('Channels: ${chs.join(', ')}', style: const TextStyle(fontSize: 12)),
+              leading: Radio<String>(
+                value: g['id'],
+                groupValue: activeId,
+                onChanged: (v) async {
+                  if (v != null && await _verifySlotPassword('ytAdmin', 'Category Badlein')) {
+                    _cfg['activeGroupId'] = v;
+                    await _save();
+                  }
+                },
+              ),
+              trailing: IconButton(
+                icon: const Icon(Icons.add),
+                onPressed: () => _addChannelToGroup(idx),
+              ),
+            ),
+          );
+        }),
+        const SizedBox(height: 12),
+        Row(
+          mainAxisAlignment: MainAxisAlignment.spaceBetween,
+          children: [
+            const Text('Blocked Title Keywords',
+                style: TextStyle(fontWeight: FontWeight.bold, fontSize: 15)),
+            TextButton(onPressed: _addBlockedKeyword, child: const Text('+ Add Word')),
+          ],
+        ),
+        Wrap(
+          spacing: 8,
+          children: keywords
+              .map((w) => Chip(
+                    label: Text(w),
+                    onDeleted: () async {
+                      if (await _verifySlotPassword('ytAdmin', 'Keyword Hatayein')) {
+                        (_cfg['blockedTitleKeywords'] as List).remove(w);
+                        await _save();
+                      }
+                    },
+                  ))
+              .toList(),
+        ),
+        const Divider(height: 32),
+        const Text('System Passwords Badlein',
+            style: TextStyle(fontWeight: FontWeight.bold, fontSize: 15)),
+        const SizedBox(height: 8),
+        _passwordTile('Master App Access Password', 'master'),
+        _passwordTile('Shorts Blocker Password', 'shorts'),
+        _passwordTile('YouTube Category / Admin Password', 'ytAdmin'),
+        _passwordTile('Settings Tamper Shield Password', 'tamper'),
+        _passwordTile('App Blocker Toggle Password', 'appBlocker'),
+      ],
+    );
+  }
+
+  Widget _passwordTile(String title, String key) {
+    return ListTile(
+      contentPadding: EdgeInsets.zero,
+      leading: const Icon(Icons.key),
+      title: Text(title),
+      trailing: const Text('Change'),
+      onTap: () async {
+        if (!await _verifySlotPassword(key, 'Purana Password Dalein')) return;
+        final ctrl = TextEditingController();
+        if (!mounted) return;
+        await showDialog(
+          context: context,
+          builder: (ctx) => AlertDialog(
+            title: Text('Naya $title'),
+            content: TextField(
+              controller: ctrl,
+              obscureText: true,
+              decoration: const InputDecoration(
+                labelText: 'Naya password (min 4 chars)',
+                border: OutlineInputBorder(),
+              ),
+            ),
+            actions: [
+              TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Cancel')),
+              FilledButton(
+                onPressed: () async {
+                  final np = ctrl.text.trim();
+                  if (np.length >= 4) {
+                    _cfg['passwords'][key] = np;
+                    await _save();
+                    if (ctx.mounted) Navigator.pop(ctx);
+                  }
+                },
+                child: const Text('Save'),
+              ),
+            ],
+          ),
         );
       },
+    );
+  }
+
+  Future<void> _addChannelToGroup(int groupIdx) async {
+    if (!await _verifySlotPassword('ytAdmin', 'Channel Add Karein')) return;
+    final ctrl = TextEditingController();
+    if (!mounted) return;
+    await showDialog(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Whitelist Channel Add Karein'),
+        content: TextField(
+          controller: ctrl,
+          decoration: const InputDecoration(labelText: 'Channel ka naam'),
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Cancel')),
+          FilledButton(
+            onPressed: () async {
+              final ch = ctrl.text.trim();
+              if (ch.isNotEmpty) {
+                ((_cfg['groups'] as List)[groupIdx]['channels'] as List).add(ch);
+                await _save();
+                if (ctx.mounted) Navigator.pop(ctx);
+              }
+            },
+            child: const Text('Add'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Future<void> _addBlockedKeyword() async {
+    final ctrl = TextEditingController();
+    await showDialog(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Blocked Word Add Karein'),
+        content: TextField(
+          controller: ctrl,
+          decoration: const InputDecoration(labelText: 'Keyword (e.g. prank)'),
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Cancel')),
+          FilledButton(
+            onPressed: () async {
+              final w = ctrl.text.trim().toLowerCase();
+              if (w.isNotEmpty) {
+                (_cfg['blockedTitleKeywords'] as List).add(w);
+                await _save();
+                if (ctx.mounted) Navigator.pop(ctx);
+              }
+            },
+            child: const Text('Add'),
+          ),
+        ],
+      ),
     );
   }
 }
