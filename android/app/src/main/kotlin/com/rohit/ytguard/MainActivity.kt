@@ -1,6 +1,8 @@
 package com.rohit.ytguard
 
 import android.app.AppOpsManager
+import android.app.admin.DevicePolicyManager
+import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
@@ -70,12 +72,49 @@ class MainActivity : FlutterActivity() {
                         startActivity(intent)
                         result.success(true)
                     }
+                    "isDeviceAdminEnabled" -> {
+                        result.success(isAdminActive())
+                    }
+                    "requestDeviceAdmin" -> {
+                        val comp = ComponentName(this, GuardDeviceAdminReceiver::class.java)
+                        val intent = Intent(DevicePolicyManager.ACTION_ADD_DEVICE_ADMIN).apply {
+                            putExtra(DevicePolicyManager.EXTRA_DEVICE_ADMIN, comp)
+                            putExtra(
+                                DevicePolicyManager.EXTRA_ADD_EXPLANATION,
+                                "Ye sirf YT Guard ka Uninstall button lock karne ke liye hai. Koi wipe ya phone lock permission nahi hai."
+                            )
+                        }
+                        startActivity(intent)
+                        result.success(true)
+                    }
+                    "removeDeviceAdmin" -> {
+                        try {
+                            val dpm = getSystemService(Context.DEVICE_POLICY_SERVICE) as DevicePolicyManager
+                            val comp = ComponentName(this, GuardDeviceAdminReceiver::class.java)
+                            if (dpm.isAdminActive(comp)) {
+                                dpm.removeActiveAdmin(comp)
+                            }
+                            result.success(true)
+                        } catch (_: Exception) {
+                            result.success(false)
+                        }
+                    }
                     "getInstalledApps" -> {
                         result.success(fetchLaunchableApps())
                     }
                     else -> result.notImplemented()
                 }
             }
+    }
+
+    private fun isAdminActive(): Boolean {
+        return try {
+            val dpm = getSystemService(Context.DEVICE_POLICY_SERVICE) as DevicePolicyManager
+            val comp = ComponentName(this, GuardDeviceAdminReceiver::class.java)
+            dpm.isAdminActive(comp)
+        } catch (_: Exception) {
+            false
+        }
     }
 
     private fun isAccessibilityServiceEnabled(): Boolean {

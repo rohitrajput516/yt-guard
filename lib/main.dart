@@ -43,6 +43,7 @@ class GuardBridge {
       'ytWhitelistEnabled': false,
       'ytBlacklistEnabled': false,
       'tamperShieldEnabled': false,
+      'geminiBlockEnabled': false,
       'appBlockerEnabled': false,
       'activeGroupId': 'study',
       'passwords': {
@@ -134,6 +135,22 @@ class GuardBridge {
 
   static Future<void> openUsageAccessSettings() async {
     await _ch.invokeMethod('openUsageAccessSettings');
+  }
+
+  static Future<bool> isDeviceAdminEnabled() async {
+    try {
+      return await _ch.invokeMethod<bool>('isDeviceAdminEnabled') ?? false;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  static Future<void> requestDeviceAdmin() async {
+    await _ch.invokeMethod('requestDeviceAdmin');
+  }
+
+  static Future<void> removeDeviceAdmin() async {
+    await _ch.invokeMethod('removeDeviceAdmin');
   }
 
   static Future<AppList> getInstalledApps() async {
@@ -252,6 +269,7 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
   bool _a11yEnabled = false;
   bool _overlayEnabled = false;
   bool _usageEnabled = false;
+  bool _adminEnabled = false;
   AppList _installedApps = [];
 
   @override
@@ -279,12 +297,14 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
     final a11y = await GuardBridge.isAccessibilityEnabled();
     final overlay = await GuardBridge.isOverlayEnabled();
     final usage = await GuardBridge.isUsageAccessEnabled();
+    final admin = await GuardBridge.isDeviceAdminEnabled();
     final apps = await GuardBridge.getInstalledApps();
     if (mounted) {
       setState(() {
         _a11yEnabled = a11y;
         _overlayEnabled = overlay;
         _usageEnabled = usage;
+        _adminEnabled = admin;
         _installedApps = apps;
       });
     }
@@ -391,7 +411,9 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
     required String title,
     required String subtitle,
     required bool granted,
-    required VoidCallback onEnable,
+    required String actionLabel,
+    required VoidCallback onAction,
+    bool showActionWhenGranted = false,
   }) {
     return Container(
       margin: const EdgeInsets.only(bottom: 8),
@@ -416,10 +438,10 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
               ],
             ),
           ),
-          if (!granted)
+          if (!granted || showActionWhenGranted)
             FilledButton(
-              onPressed: onEnable,
-              child: const Text('Allow'),
+              onPressed: onAction,
+              child: Text(actionLabel),
             ),
         ],
       ),
@@ -431,37 +453,63 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
       padding: const EdgeInsets.all(16),
       children: [
         const Text(
-          'Required Permissions (Teeno Allow Karein)',
+          'Permissions & Uninstall Protection',
           style: TextStyle(fontWeight: FontWeight.bold, fontSize: 14),
         ),
         const SizedBox(height: 8),
         _permissionRow(
           title: '1. Accessibility Service',
-          subtitle: 'YouTube Shorts, videos aur Settings detect karne ke liye',
+          subtitle: 'YouTube, Gemini aur Settings detect karne ke liye',
           granted: _a11yEnabled,
-          onEnable: GuardBridge.openAccessibilitySettings,
+          actionLabel: 'Allow',
+          onAction: GuardBridge.openAccessibilitySettings,
         ),
         _permissionRow(
           title: '2. Display Over Other Apps',
-          subtitle: 'Full-screen password lock pop-up dikhane ke liye',
+          subtitle: 'Full-screen password pop-up dikhane ke liye',
           granted: _overlayEnabled,
-          onEnable: GuardBridge.openOverlaySettings,
+          actionLabel: 'Allow',
+          onAction: GuardBridge.openOverlaySettings,
         ),
         _permissionRow(
           title: '3. Usage Access',
-          subtitle: 'Locked apps ko turant track karke block karne ke liye',
+          subtitle: 'Background app backup tracking ke liye',
           granted: _usageEnabled,
-          onEnable: GuardBridge.openUsageAccessSettings,
+          actionLabel: 'Allow',
+          onAction: GuardBridge.openUsageAccessSettings,
+        ),
+        _permissionRow(
+          title: '4. Safe Device Admin (Uninstall Lock)',
+          subtitle: _adminEnabled
+              ? 'Active hai — Uninstall button system level par locked hai'
+              : 'Optional: Sirf uninstall rokne ke liye (zero wipe risk)',
+          granted: _adminEnabled,
+          actionLabel: _adminEnabled ? 'Disable' : 'Enable',
+          showActionWhenGranted: true,
+          onAction: () async {
+            if (_adminEnabled) {
+              final ok = await _verifySlotPassword('tamper', 'Uninstall Shield Disable Karein');
+              if (ok) {
+                await GuardBridge.removeDeviceAdmin();
+                await _refreshStatus();
+              }
+            } else {
+              final ok = await _verifySlotPassword('tamper', 'Uninstall Shield Enable Karein');
+              if (ok) {
+                await GuardBridge.requestDeviceAdmin();
+              }
+            }
+          },
         ),
         const SizedBox(height: 12),
         const Text(
-          'Feature Switches (ON/OFF Dono Ke Liye Password)',
+          'Feature Switches (Sab Default OFF, ON/OFF Ke Liye Password)',
           style: TextStyle(fontWeight: FontWeight.bold, fontSize: 14),
         ),
         const SizedBox(height: 8),
         _featureSwitchTile(
           title: 'YouTube Shorts Blocker',
-          subtitle: 'Shorts khulne par full-screen pop-up dikhayega (No auto-back)',
+          subtitle: 'Shorts player khulte hi full-screen pop-up (No auto-back)',
           value: _cfg['shortsBlockEnabled'] == true,
           onChanged: (v) => _toggleFeatureWithPassword(
             configKey: 'shortsBlockEnabled',
@@ -472,7 +520,7 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
         ),
         _featureSwitchTile(
           title: 'YouTube Category / Channel Filter',
-          subtitle: 'Sirf active category ke channels chalenge, baaki par pop-up aayega',
+          subtitle: 'Video tap hote hi microsecond check, feed/search safe rahega',
           value: _cfg['ytWhitelistEnabled'] == true,
           onChanged: (v) => _toggleFeatureWithPassword(
             configKey: 'ytWhitelistEnabled',
@@ -483,7 +531,7 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
         ),
         _featureSwitchTile(
           title: 'YouTube Keyword Blacklist',
-          subtitle: 'Blocked shabd wali video chalne par pop-up aayega',
+          subtitle: 'Blocked shabd wali video par turant pop-up aayega',
           value: _cfg['ytBlacklistEnabled'] == true,
           onChanged: (v) => _toggleFeatureWithPassword(
             configKey: 'ytBlacklistEnabled',
@@ -493,8 +541,19 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
           ),
         ),
         _featureSwitchTile(
+          title: 'Gemini Complete Blocker',
+          subtitle: 'App, Power button, Play Store & Browser sab block (Google Search safe)',
+          value: _cfg['geminiBlockEnabled'] == true,
+          onChanged: (v) => _toggleFeatureWithPassword(
+            configKey: 'geminiBlockEnabled',
+            slotKey: 'appBlocker',
+            featureName: 'Gemini Blocker',
+            newValue: v,
+          ),
+        ),
+        _featureSwitchTile(
           title: 'Settings Tamper Shield',
-          subtitle: 'Uninstall, Clear Data aur Accessibility page par pop-up lock',
+          subtitle: 'App Info, Uninstall, Device Admin & Accessibility par real Activity lock',
           value: _cfg['tamperShieldEnabled'] == true,
           onChanged: (v) => _toggleFeatureWithPassword(
             configKey: 'tamperShieldEnabled',
@@ -917,11 +976,20 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
     return ListView(
       padding: const EdgeInsets.all(16),
       children: [
-        const Text(
-          'YouTube Active Category (Whitelist)',
-          style: TextStyle(fontWeight: FontWeight.bold, fontSize: 15),
+        Row(
+          mainAxisAlignment: MainAxisAlignment.spaceBetween,
+          children: [
+            const Text(
+              'YouTube Active Category',
+              style: TextStyle(fontWeight: FontWeight.bold, fontSize: 15),
+            ),
+            TextButton(
+              onPressed: _createYouTubeCategory,
+              child: const Text('+ Nayi Category'),
+            ),
+          ],
         ),
-        const SizedBox(height: 8),
+        const SizedBox(height: 6),
         ...groups.asMap().entries.map((entry) {
           final idx = entry.key;
           final g = entry.value;
@@ -929,6 +997,7 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
           final chs = List<String>.from(g['channels'] ?? []);
           return Container(
             margin: const EdgeInsets.only(bottom: 10),
+            padding: const EdgeInsets.all(10),
             decoration: BoxDecoration(
               borderRadius: BorderRadius.circular(12),
               border: Border.all(
@@ -937,23 +1006,44 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
                     : Theme.of(context).dividerColor,
               ),
             ),
-            child: ListTile(
-              onTap: () async {
-                if (!isSelected && await _verifySlotPassword('ytAdmin', 'Category Badlein')) {
-                  _cfg['activeGroupId'] = g['id'];
-                  await _save();
-                }
-              },
-              title: Text(g['name'] ?? '', style: const TextStyle(fontWeight: FontWeight.w600)),
-              subtitle: Text('Channels: ${chs.join(', ')}', style: const TextStyle(fontSize: 12)),
-              leading: Icon(
-                isSelected ? Icons.radio_button_checked : Icons.radio_button_off,
-                color: isSelected ? Theme.of(context).colorScheme.primary : null,
-              ),
-              trailing: IconButton(
-                icon: const Icon(Icons.add),
-                onPressed: () => _addChannelToGroup(idx),
-              ),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                ListTile(
+                  contentPadding: EdgeInsets.zero,
+                  onTap: () async {
+                    if (!isSelected && await _verifySlotPassword('ytAdmin', 'Category Badlein')) {
+                      _cfg['activeGroupId'] = g['id'];
+                      await _save();
+                    }
+                  },
+                  title: Text(g['name'] ?? '', style: const TextStyle(fontWeight: FontWeight.w600)),
+                  leading: Icon(
+                    isSelected ? Icons.radio_button_checked : Icons.radio_button_off,
+                    color: isSelected ? Theme.of(context).colorScheme.primary : null,
+                  ),
+                  trailing: IconButton(
+                    icon: const Icon(Icons.add),
+                    tooltip: 'Add Channel',
+                    onPressed: () => _addChannelToGroup(idx),
+                  ),
+                ),
+                Wrap(
+                  spacing: 6,
+                  runSpacing: 4,
+                  children: chs
+                      .map((ch) => Chip(
+                            label: Text(ch, style: const TextStyle(fontSize: 12)),
+                            onDeleted: () async {
+                              if (await _verifySlotPassword('ytAdmin', 'Channel Hatayein')) {
+                                ((_cfg['groups'] as List)[idx]['channels'] as List).remove(ch);
+                                await _save();
+                              }
+                            },
+                          ))
+                      .toList(),
+                ),
+              ],
             ),
           );
         }),
@@ -992,7 +1082,7 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
         _passwordTile('Shorts Blocker Password', 'shorts'),
         _passwordTile('YouTube Category / Admin Password', 'ytAdmin'),
         _passwordTile('Settings Tamper Shield Password', 'tamper'),
-        _passwordTile('App Blocker Toggle Password', 'appBlocker'),
+        _passwordTile('App / Gemini Blocker Password', 'appBlocker'),
       ],
     );
   }
@@ -1039,6 +1129,40 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
     );
   }
 
+  Future<void> _createYouTubeCategory() async {
+    if (!await _verifySlotPassword('ytAdmin', 'Nayi Category Banayein')) return;
+    final ctrl = TextEditingController();
+    if (!mounted) return;
+    await showDialog(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Nayi YouTube Category'),
+        content: TextField(
+          controller: ctrl,
+          decoration: const InputDecoration(labelText: 'Category Name (e.g. NDA Maths)'),
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Cancel')),
+          FilledButton(
+            onPressed: () async {
+              final name = ctrl.text.trim();
+              if (name.isNotEmpty) {
+                (_cfg['groups'] as List).add({
+                  'id': 'grp_${DateTime.now().millisecondsSinceEpoch}',
+                  'name': name,
+                  'channels': <String>[],
+                });
+                await _save();
+                if (ctx.mounted) Navigator.pop(ctx);
+              }
+            },
+            child: const Text('Create'),
+          ),
+        ],
+      ),
+    );
+  }
+
   Future<void> _addChannelToGroup(int groupIdx) async {
     if (!await _verifySlotPassword('ytAdmin', 'Channel Add Karein')) return;
     final ctrl = TextEditingController();
@@ -1049,7 +1173,7 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
         title: const Text('Whitelist Channel Add Karein'),
         content: TextField(
           controller: ctrl,
-          decoration: const InputDecoration(labelText: 'Channel ka naam'),
+          decoration: const InputDecoration(labelText: 'Channel ka naam ya @handle'),
         ),
         actions: [
           TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Cancel')),
