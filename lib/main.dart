@@ -346,6 +346,35 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
       ..showSnackBar(SnackBar(content: Text(msg), behavior: SnackBarBehavior.floating));
   }
 
+  Widget _buildPasswordField({
+    required TextEditingController controller,
+    required String label,
+    required bool obscure,
+    required VoidCallback onToggleObscure,
+    String? errorText,
+    bool autofocus = false,
+    ValueChanged<String>? onSubmitted,
+  }) {
+    return TextField(
+      controller: controller,
+      obscureText: obscure,
+      autofocus: autofocus,
+      enableSuggestions: false,
+      autocorrect: false,
+      decoration: InputDecoration(
+        labelText: label,
+        border: const OutlineInputBorder(),
+        errorText: errorText,
+        suffixIcon: IconButton(
+          tooltip: obscure ? 'Show password' : 'Hide password',
+          icon: Icon(obscure ? Icons.visibility_off_outlined : Icons.visibility_outlined),
+          onPressed: onToggleObscure,
+        ),
+      ),
+      onSubmitted: onSubmitted,
+    );
+  }
+
   Future<bool> _verifyPassword({
     required String expected,
     required String title,
@@ -353,6 +382,7 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
   }) async {
     final ctrl = TextEditingController();
     bool ok = false;
+    bool obscure = true;
     String? err;
 
     await showDialog(
@@ -366,15 +396,13 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
             children: [
               Text(subtitle, style: const TextStyle(fontSize: 13)),
               const SizedBox(height: 14),
-              TextField(
+              _buildPasswordField(
                 controller: ctrl,
-                obscureText: true,
+                label: 'Password',
+                obscure: obscure,
                 autofocus: true,
-                decoration: InputDecoration(
-                  labelText: 'Password',
-                  border: const OutlineInputBorder(),
-                  errorText: err,
-                ),
+                errorText: err,
+                onToggleObscure: () => setModalState(() => obscure = !obscure),
                 onSubmitted: (_) {
                   if (ctrl.text.trim() == expected) {
                     ok = true;
@@ -418,6 +446,104 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
       expected: expected,
       title: title,
       subtitle: subtitle ?? 'Enter password to confirm this change.',
+    );
+  }
+
+  Future<void> _showThreeStepChangePasswordDialog({
+    required String title,
+    required String currentExpected,
+    required Future<void> Function(String newPassword) onSaveNewPassword,
+  }) async {
+    final currentCtrl = TextEditingController();
+    final newCtrl = TextEditingController();
+    final confirmCtrl = TextEditingController();
+
+    bool hideCurrent = true;
+    bool hideNew = true;
+    bool hideConfirm = true;
+
+    String? currentErr;
+    String? newErr;
+    String? confirmErr;
+
+    await showDialog(
+      context: context,
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setModalState) => AlertDialog(
+          title: Text('Change $title', style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+          content: SingleChildScrollView(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                _buildPasswordField(
+                  controller: currentCtrl,
+                  label: 'Current Password',
+                  obscure: hideCurrent,
+                  autofocus: true,
+                  errorText: currentErr,
+                  onToggleObscure: () => setModalState(() => hideCurrent = !hideCurrent),
+                ),
+                const SizedBox(height: 12),
+                _buildPasswordField(
+                  controller: newCtrl,
+                  label: 'Create New Password (min 4 chars)',
+                  obscure: hideNew,
+                  errorText: newErr,
+                  onToggleObscure: () => setModalState(() => hideNew = !hideNew),
+                ),
+                const SizedBox(height: 12),
+                _buildPasswordField(
+                  controller: confirmCtrl,
+                  label: 'Confirm New Password',
+                  obscure: hideConfirm,
+                  errorText: confirmErr,
+                  onToggleObscure: () => setModalState(() => hideConfirm = !hideConfirm),
+                ),
+              ],
+            ),
+          ),
+          actions: [
+            TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Cancel')),
+            FilledButton(
+              onPressed: () async {
+                final cur = currentCtrl.text.trim();
+                final np = newCtrl.text.trim();
+                final cp = confirmCtrl.text.trim();
+
+                String? cErr;
+                String? nErr;
+                String? cfErr;
+
+                if (cur != currentExpected) {
+                  cErr = 'Current password is incorrect.';
+                }
+                if (np.length < 4) {
+                  nErr = 'New password must be at least 4 characters.';
+                }
+                if (cp.isEmpty) {
+                  cfErr = 'Please confirm your new password.';
+                } else if (np != cp) {
+                  cfErr = 'New passwords do not match.';
+                }
+
+                if (cErr != null || nErr != null || cfErr != null) {
+                  setModalState(() {
+                    currentErr = cErr;
+                    newErr = nErr;
+                    confirmErr = cfErr;
+                  });
+                  return;
+                }
+
+                await onSaveNewPassword(np);
+                if (ctx.mounted) Navigator.pop(ctx);
+                _showSnack('Password updated successfully.');
+              },
+              child: const Text('Save'),
+            ),
+          ],
+        ),
+      ),
     );
   }
 
@@ -516,12 +642,10 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
   Future<void> _toggleFeature(_FeatureMeta f, bool newValue) async {
     if (_cfg == null) return;
     if (newValue) {
-      // Turning ON is instant with zero password friction
       _cfg![f.key] = true;
       await _save();
       _showSnack('${f.shortName} shield ON');
     } else {
-      // Turning OFF strictly requires password
       final ok = await _verifySlotPassword(
         f.slotKey,
         'Turn OFF ${f.title}',
@@ -633,7 +757,6 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
     return ListView(
       padding: const EdgeInsets.fromLTRB(16, 12, 16, 24),
       children: [
-        // HERO STUDY MODE CARD
         Container(
           padding: const EdgeInsets.all(20),
           decoration: BoxDecoration(
@@ -762,12 +885,8 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
           ),
         ),
         const SizedBox(height: 16),
-
-        // COLLAPSIBLE PERMISSIONS SECTION
         _buildPermissionsSection(),
         const SizedBox(height: 18),
-
-        // PROTECTION SHIELDS LIST
         const Text(
           'Protection Shields',
           style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
@@ -1056,6 +1175,21 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
                         child: const Text('Select Apps'),
                       ),
                       IconButton(
+                        icon: const Icon(Icons.key_rounded, size: 20),
+                        tooltip: 'Change Category Password',
+                        onPressed: () async {
+                          final currentPwd = (cat['password'] ?? '5555').toString();
+                          await _showThreeStepChangePasswordDialog(
+                            title: '${cat['name']} Password',
+                            currentExpected: currentPwd,
+                            onSaveNewPassword: (newPwd) async {
+                              ((_cfg!['appCategories'] as List)[idx] as Map)['password'] = newPwd;
+                              await _save();
+                            },
+                          );
+                        },
+                      ),
+                      IconButton(
                         icon: const Icon(Icons.delete_outline_rounded, size: 20),
                         tooltip: 'Delete Category',
                         onPressed: () async {
@@ -1106,21 +1240,41 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
               leading: const Icon(Icons.lock_rounded),
               title: Text(app['appName'] ?? app['packageName'] ?? '', style: const TextStyle(fontWeight: FontWeight.w600)),
               subtitle: Text(app['packageName'] ?? '', style: const TextStyle(fontSize: 11)),
-              trailing: IconButton(
-                icon: const Icon(Icons.delete_outline_rounded),
-                tooltip: 'Remove Lock',
-                onPressed: () async {
-                  final expected = (app['password'] ?? '5555').toString();
-                  final ok = await _verifyPassword(
-                    expected: expected,
-                    title: 'Unlock ${app['appName']}',
-                    subtitle: 'Enter this app\'s password to remove the lock.',
-                  );
-                  if (ok) {
-                    (_cfg!['individualLockedApps'] as List).removeAt(idx);
-                    await _save();
-                  }
-                },
+              trailing: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  IconButton(
+                    icon: const Icon(Icons.key_rounded, size: 20),
+                    tooltip: 'Change App Password',
+                    onPressed: () async {
+                      final currentPwd = (app['password'] ?? '5555').toString();
+                      await _showThreeStepChangePasswordDialog(
+                        title: '${app['appName']} Password',
+                        currentExpected: currentPwd,
+                        onSaveNewPassword: (newPwd) async {
+                          ((_cfg!['individualLockedApps'] as List)[idx] as Map)['password'] = newPwd;
+                          await _save();
+                        },
+                      );
+                    },
+                  ),
+                  IconButton(
+                    icon: const Icon(Icons.delete_outline_rounded),
+                    tooltip: 'Remove Lock',
+                    onPressed: () async {
+                      final expected = (app['password'] ?? '5555').toString();
+                      final ok = await _verifyPassword(
+                        expected: expected,
+                        title: 'Unlock ${app['appName']}',
+                        subtitle: 'Enter this app\'s password to remove the lock.',
+                      );
+                      if (ok) {
+                        (_cfg!['individualLockedApps'] as List).removeAt(idx);
+                        await _save();
+                      }
+                    },
+                  ),
+                ],
               ),
             ),
           );
@@ -1150,33 +1304,48 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
   Future<void> _createAppCategoryDialog() async {
     final nameCtrl = TextEditingController();
     final pwdCtrl = TextEditingController();
-    String? err;
+    final confirmCtrl = TextEditingController();
+    bool hideNew = true;
+    bool hideConfirm = true;
+    String? nameErr;
+    String? pwdErr;
+    String? confirmErr;
+
     await showDialog(
       context: context,
       builder: (ctx) => StatefulBuilder(
         builder: (ctx, setModalState) => AlertDialog(
           title: const Text('New App Category'),
-          content: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              TextField(
-                controller: nameCtrl,
-                decoration: const InputDecoration(
-                  labelText: 'Category Name (e.g. Social Media)',
-                  border: OutlineInputBorder(),
+          content: SingleChildScrollView(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                TextField(
+                  controller: nameCtrl,
+                  decoration: InputDecoration(
+                    labelText: 'Category Name (e.g. Social Media)',
+                    border: const OutlineInputBorder(),
+                    errorText: nameErr,
+                  ),
                 ),
-              ),
-              const SizedBox(height: 12),
-              TextField(
-                controller: pwdCtrl,
-                obscureText: true,
-                decoration: InputDecoration(
-                  labelText: 'Category Password (min 4 chars)',
-                  border: const OutlineInputBorder(),
-                  errorText: err,
+                const SizedBox(height: 12),
+                _buildPasswordField(
+                  controller: pwdCtrl,
+                  label: 'New Password (min 4 chars)',
+                  obscure: hideNew,
+                  errorText: pwdErr,
+                  onToggleObscure: () => setModalState(() => hideNew = !hideNew),
                 ),
-              ),
-            ],
+                const SizedBox(height: 12),
+                _buildPasswordField(
+                  controller: confirmCtrl,
+                  label: 'Confirm Password',
+                  obscure: hideConfirm,
+                  errorText: confirmErr,
+                  onToggleObscure: () => setModalState(() => hideConfirm = !hideConfirm),
+                ),
+              ],
+            ),
           ),
           actions: [
             TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Cancel')),
@@ -1184,10 +1353,29 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
               onPressed: () async {
                 final name = nameCtrl.text.trim();
                 final pwd = pwdCtrl.text.trim();
-                if (name.isEmpty || pwd.length < 4) {
-                  setModalState(() => err = 'Enter a name and at least 4 characters.');
+                final cpwd = confirmCtrl.text.trim();
+
+                String? nErr;
+                String? pErr;
+                String? cErr;
+
+                if (name.isEmpty) nErr = 'Enter a category name.';
+                if (pwd.length < 4) pErr = 'Password must be at least 4 characters.';
+                if (cpwd.isEmpty) {
+                  cErr = 'Please confirm your password.';
+                } else if (pwd != cpwd) {
+                  cErr = 'Passwords do not match.';
+                }
+
+                if (nErr != null || pErr != null || cErr != null) {
+                  setModalState(() {
+                    nameErr = nErr;
+                    pwdErr = pErr;
+                    confirmErr = cErr;
+                  });
                   return;
                 }
+
                 (_cfg!['appCategories'] as List).add({
                   'id': 'cat_${DateTime.now().millisecondsSinceEpoch}',
                   'name': name,
@@ -1196,6 +1384,7 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
                 });
                 await _save();
                 if (ctx.mounted) Navigator.pop(ctx);
+                _showSnack('Category "$name" created.');
               },
               child: const Text('Create'),
             ),
@@ -1266,7 +1455,6 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
               TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Cancel')),
               FilledButton(
                 onPressed: () async {
-                  // Removing any previously locked app requires this category's password
                   final removedAny = original.any((pkg) => !selected.contains(pkg));
                   if (removedAny) {
                     final catPwd = (cat['password'] ?? '5555').toString();
@@ -1295,7 +1483,12 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
     String query = '';
     AppMap? pickedApp;
     final pwdCtrl = TextEditingController();
-    String? err;
+    final confirmCtrl = TextEditingController();
+    bool hideNew = true;
+    bool hideConfirm = true;
+    String? appErr;
+    String? pwdErr;
+    String? confirmErr;
 
     await showDialog(
       context: context,
@@ -1310,44 +1503,69 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
             title: const Text('Lock Single App'),
             content: SizedBox(
               width: double.maxFinite,
-              height: 420,
-              child: Column(
-                children: [
-                  TextField(
-                    decoration: const InputDecoration(
-                      hintText: 'Search apps...',
-                      prefixIcon: Icon(Icons.search),
-                      border: OutlineInputBorder(),
+              child: SingleChildScrollView(
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    TextField(
+                      decoration: const InputDecoration(
+                        hintText: 'Search apps...',
+                        prefixIcon: Icon(Icons.search),
+                        border: OutlineInputBorder(),
+                      ),
+                      onChanged: (v) => setModalState(() => query = v),
                     ),
-                    onChanged: (v) => setModalState(() => query = v),
-                  ),
-                  const SizedBox(height: 8),
-                  Expanded(
-                    child: ListView.builder(
-                      itemCount: filtered.length,
-                      itemBuilder: (_, i) {
-                        final app = filtered[i];
-                        final isSel = pickedApp?['packageName'] == app['packageName'];
-                        return ListTile(
-                          selected: isSel,
-                          title: Text(app['appName'] ?? ''),
-                          trailing: isSel ? const Icon(Icons.check_circle_rounded) : null,
-                          onTap: () => setModalState(() => pickedApp = app),
-                        );
-                      },
+                    const SizedBox(height: 8),
+                    Container(
+                      height: 185,
+                      decoration: BoxDecoration(
+                        borderRadius: BorderRadius.circular(10),
+                        border: Border.all(
+                          color: appErr != null ? Colors.red : Theme.of(context).dividerColor,
+                        ),
+                      ),
+                      child: ListView.builder(
+                        itemCount: filtered.length,
+                        itemBuilder: (_, i) {
+                          final app = filtered[i];
+                          final isSel = pickedApp?['packageName'] == app['packageName'];
+                          return ListTile(
+                            dense: true,
+                            selected: isSel,
+                            title: Text(app['appName'] ?? ''),
+                            trailing: isSel ? const Icon(Icons.check_circle_rounded, size: 18) : null,
+                            onTap: () => setModalState(() {
+                              pickedApp = app;
+                              appErr = null;
+                            }),
+                          );
+                        },
+                      ),
                     ),
-                  ),
-                  const SizedBox(height: 8),
-                  TextField(
-                    controller: pwdCtrl,
-                    obscureText: true,
-                    decoration: InputDecoration(
-                      labelText: 'App Password (min 4 chars)',
-                      border: const OutlineInputBorder(),
-                      errorText: err,
+                    if (appErr != null)
+                      Padding(
+                        padding: const EdgeInsets.only(top: 4, left: 4),
+                        child: Text(appErr!, style: const TextStyle(color: Colors.red, fontSize: 12)),
+                      ),
+                    const SizedBox(height: 12),
+                    _buildPasswordField(
+                      controller: pwdCtrl,
+                      label: 'New Password (min 4 chars)',
+                      obscure: hideNew,
+                      errorText: pwdErr,
+                      onToggleObscure: () => setModalState(() => hideNew = !hideNew),
                     ),
-                  ),
-                ],
+                    const SizedBox(height: 12),
+                    _buildPasswordField(
+                      controller: confirmCtrl,
+                      label: 'Confirm Password',
+                      obscure: hideConfirm,
+                      errorText: confirmErr,
+                      onToggleObscure: () => setModalState(() => hideConfirm = !hideConfirm),
+                    ),
+                  ],
+                ),
               ),
             ),
             actions: [
@@ -1355,10 +1573,29 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
               FilledButton(
                 onPressed: () async {
                   final pwd = pwdCtrl.text.trim();
-                  if (pickedApp == null || pwd.length < 4) {
-                    setModalState(() => err = 'Select an app and enter at least 4 characters.');
+                  final cpwd = confirmCtrl.text.trim();
+
+                  String? aErr;
+                  String? pErr;
+                  String? cErr;
+
+                  if (pickedApp == null) aErr = 'Please select an app first.';
+                  if (pwd.length < 4) pErr = 'Password must be at least 4 characters.';
+                  if (cpwd.isEmpty) {
+                    cErr = 'Please confirm your password.';
+                  } else if (pwd != cpwd) {
+                    cErr = 'Passwords do not match.';
+                  }
+
+                  if (aErr != null || pErr != null || cErr != null) {
+                    setModalState(() {
+                      appErr = aErr;
+                      pwdErr = pErr;
+                      confirmErr = cErr;
+                    });
                     return;
                   }
+
                   final list = _cfg!['individualLockedApps'] as List;
                   list.removeWhere((e) => e['packageName'] == pickedApp!['packageName']);
                   list.add({
@@ -1368,6 +1605,7 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
                   });
                   await _save();
                   if (ctx.mounted) Navigator.pop(ctx);
+                  _showSnack('${pickedApp!['appName']} locked.');
                 },
                 child: const Text('Lock App'),
               ),
@@ -1476,49 +1714,14 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
         title: Text(title, style: const TextStyle(fontSize: 14, fontWeight: FontWeight.w500)),
         trailing: const Text('Change', style: TextStyle(fontWeight: FontWeight.bold)),
         onTap: () async {
-          final ok = await _verifySlotPassword(
-            key,
-            'Verify Current Password',
-            subtitle: 'Enter your current password before changing it.',
-          );
-          if (!ok || !mounted) return;
-
-          final ctrl = TextEditingController();
-          String? err;
-          await showDialog(
-            context: context,
-            builder: (ctx) => StatefulBuilder(
-              builder: (ctx, setModalState) => AlertDialog(
-                title: Text('Change $title'),
-                content: TextField(
-                  controller: ctrl,
-                  obscureText: true,
-                  autofocus: true,
-                  decoration: InputDecoration(
-                    labelText: 'New Password (min 4 chars)',
-                    border: const OutlineInputBorder(),
-                    errorText: err,
-                  ),
-                ),
-                actions: [
-                  TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Cancel')),
-                  FilledButton(
-                    onPressed: () async {
-                      final np = ctrl.text.trim();
-                      if (np.length < 4) {
-                        setModalState(() => err = 'Password must be at least 4 characters.');
-                        return;
-                      }
-                      (_cfg!['passwords'] as Map)[key] = np;
-                      await _save();
-                      if (ctx.mounted) Navigator.pop(ctx);
-                      _showSnack('Password updated.');
-                    },
-                    child: const Text('Save'),
-                  ),
-                ],
-              ),
-            ),
+          final currentExpected = (_cfg!['passwords']?[key] ?? '0000').toString();
+          await _showThreeStepChangePasswordDialog(
+            title: title,
+            currentExpected: currentExpected,
+            onSaveNewPassword: (newPwd) async {
+              (_cfg!['passwords'] as Map)[key] = newPwd;
+              await _save();
+            },
           );
         },
       ),
