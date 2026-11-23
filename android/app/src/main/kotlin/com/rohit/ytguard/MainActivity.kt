@@ -1,6 +1,8 @@
 package com.rohit.ytguard
 
+import android.Manifest
 import android.app.AppOpsManager
+import android.app.NotificationManager
 import android.app.admin.DevicePolicyManager
 import android.content.ComponentName
 import android.content.Context
@@ -23,6 +25,7 @@ class MainActivity : FlutterActivity() {
     private val CHANNEL = "com.rohit.ytguard/control"
     private val PREFS_NAME = "ytguard_prefs"
     private val KEY_CONFIG = "config_json"
+    private var notifRequestedOnce = false
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
@@ -37,6 +40,8 @@ class MainActivity : FlutterActivity() {
                             .putString(KEY_CONFIG, json)
                             .commit()
                         GuardRuntimeState.bumpConfigVersion()
+                        GuardForegroundService.syncFromJson(this, json)
+                        GuardRuntimeState.activeService?.onConfigUpdated()
                         result.success(true)
                     }
                     "loadConfig" -> {
@@ -92,6 +97,13 @@ class MainActivity : FlutterActivity() {
                         }
                         result.success(true)
                     }
+                    "isNotificationEnabled" -> {
+                        result.success(isNotificationAllowed())
+                    }
+                    "requestNotificationPermission" -> {
+                        requestNotificationAccess()
+                        result.success(true)
+                    }
                     "isDeviceAdminEnabled" -> {
                         result.success(isAdminActive())
                     }
@@ -101,7 +113,7 @@ class MainActivity : FlutterActivity() {
                             putExtra(DevicePolicyManager.EXTRA_DEVICE_ADMIN, comp)
                             putExtra(
                                 DevicePolicyManager.EXTRA_ADD_EXPLANATION,
-                                "Ye sirf YT Guard ka Uninstall button lock karne ke liye hai. Koi wipe ya phone lock permission nahi hai."
+                                "Prevents accidental uninstallation of YT Guard. No data wipe or phone lock permissions are requested."
                             )
                         }
                         startActivity(intent)
@@ -125,6 +137,43 @@ class MainActivity : FlutterActivity() {
                     else -> result.notImplemented()
                 }
             }
+    }
+
+    private fun isNotificationAllowed(): Boolean {
+        return try {
+            val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED &&
+                    nm.areNotificationsEnabled()
+            } else {
+                nm.areNotificationsEnabled()
+            }
+        } catch (_: Exception) {
+            true
+        }
+    }
+
+    private fun requestNotificationAccess() {
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                val granted = checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED
+                if (!granted && !notifRequestedOnce) {
+                    notifRequestedOnce = true
+                    requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 901)
+                    return
+                }
+            }
+            val intent = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS).apply {
+                    putExtra(Settings.EXTRA_APP_PACKAGE, packageName)
+                }
+            } else {
+                Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:$packageName"))
+            }
+            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            startActivity(intent)
+        } catch (_: Exception) {
+        }
     }
 
     private fun isBatteryUnrestricted(): Boolean {
@@ -200,7 +249,6 @@ class MainActivity : FlutterActivity() {
         for (ri in resolveInfos) {
             val pkg = ri.activityInfo?.packageName ?: continue
             val lowerPkg = pkg.lowercase()
-            // Hard-exclude YT Guard itself and PhonePe
             if (pkg == packageName || lowerPkg == "com.phonepe.app" || lowerPkg.startsWith("com.phonepe.") || seen.contains(pkg)) {
                 continue
             }

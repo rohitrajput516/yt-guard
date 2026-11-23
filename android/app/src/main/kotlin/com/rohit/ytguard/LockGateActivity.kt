@@ -42,17 +42,6 @@ object GuardRuntimeState {
         cooldownUntil = System.currentTimeMillis() + durationMs
     }
 
-    fun isInCooldown(tag: String, now: Long): Boolean {
-        return tag.isNotEmpty() && tag == cooldownTag && now < cooldownUntil
-    }
-
-    fun clearCooldownIfDifferent(tag: String) {
-        if (tag.isNotEmpty() && tag != cooldownTag) {
-            cooldownTag = ""
-            cooldownUntil = 0L
-        }
-    }
-
     fun clearAllTempUnlocks() {
         appUnlockExpiry.clear()
         settingsUnlockExpiry = 0L
@@ -164,7 +153,7 @@ class LockGateActivity : Activity() {
         val cooldownTag = intent.getStringExtra("cooldownTag") ?: "gate"
         val badge = intent.getStringExtra("badge") ?: "YT GUARD • LOCKED"
         val title = intent.getStringExtra("title") ?: "Access Locked"
-        val message = intent.getStringExtra("message") ?: "Home screen par jayein ya password dalein."
+        val message = intent.getStringExtra("message") ?: "Return to Home screen or enter your password to unlock."
         val expectedPassword = intent.getStringExtra("expectedPassword") ?: "0000"
         val unlockType = intent.getStringExtra("unlockType") ?: "settings"
         val targetKey = intent.getStringExtra("targetKey") ?: ""
@@ -186,10 +175,10 @@ class LockGateActivity : Activity() {
         val card = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             gravity = Gravity.CENTER_HORIZONTAL
-            setPadding(dp(22), dp(26), dp(22), dp(22))
+            setPadding(dp(24), dp(28), dp(24), dp(24))
             background = GradientDrawable().apply {
-                setColor(Color.parseColor("#1E293B"))
-                cornerRadius = dp(20).toFloat()
+                setColor(Color.parseColor("#111827"))
+                cornerRadius = dp(22).toFloat()
                 setStroke(dp(1), Color.parseColor("#334155"))
             }
         }
@@ -197,19 +186,24 @@ class LockGateActivity : Activity() {
         val badgeTv = TextView(this).apply {
             text = badge
             setTextColor(Color.parseColor("#38BDF8"))
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
             setTypeface(null, Typeface.BOLD)
             gravity = Gravity.CENTER
+            setPadding(dp(12), dp(5), dp(12), dp(5))
+            background = GradientDrawable().apply {
+                setColor(Color.parseColor("#1E293B"))
+                cornerRadius = dp(20).toFloat()
+            }
         }
         card.addView(badgeTv)
 
         val titleTv = TextView(this).apply {
             text = title
             setTextColor(Color.WHITE)
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 20f)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 21f)
             setTypeface(null, Typeface.BOLD)
             gravity = Gravity.CENTER
-            setPadding(0, dp(10), 0, dp(8))
+            setPadding(0, dp(14), 0, dp(8))
         }
         card.addView(titleTv)
 
@@ -218,12 +212,12 @@ class LockGateActivity : Activity() {
             setTextColor(Color.parseColor("#CBD5E1"))
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
             gravity = Gravity.CENTER
-            setPadding(0, 0, 0, dp(18))
+            setPadding(0, 0, 0, dp(20))
         }
         card.addView(msgTv)
 
         val exitBtn = Button(this).apply {
-            text = if (goDirectHome) "Home Screen Par Jayein" else "Pichhle Page Par Jayein"
+            text = if (goDirectHome) "Go to Home Screen" else "Go Back"
             isAllCaps = false
             setTextColor(Color.parseColor("#0F172A"))
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 15f)
@@ -258,11 +252,11 @@ class LockGateActivity : Activity() {
             LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT,
                 LinearLayout.LayoutParams.WRAP_CONTENT
-            ).apply { bottomMargin = dp(18) }
+            ).apply { bottomMargin = dp(20) }
         )
 
         val timerLabel = TextView(this).apply {
-            text = "Unlock Time Chunein (1 - 45 min):"
+            text = "Unlock Duration (1 - 45 min)"
             setTextColor(Color.parseColor("#94A3B8"))
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
             setPadding(0, 0, 0, dp(8))
@@ -279,7 +273,7 @@ class LockGateActivity : Activity() {
             setPadding(dp(8), dp(8), dp(8), dp(8))
             background = GradientDrawable().apply {
                 setColor(Color.parseColor("#0F172A"))
-                cornerRadius = dp(8).toFloat()
+                cornerRadius = dp(10).toFloat()
                 setStroke(dp(1), Color.parseColor("#475569"))
             }
         }
@@ -296,8 +290,9 @@ class LockGateActivity : Activity() {
                 setTextColor(Color.WHITE)
                 setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
                 background = GradientDrawable().apply {
-                    setColor(Color.parseColor("#334155"))
-                    cornerRadius = dp(8).toFloat()
+                    setColor(Color.parseColor("#1E293B"))
+                    cornerRadius = dp(10).toFloat()
+                    setStroke(dp(1), Color.parseColor("#334155"))
                 }
                 setPadding(dp(4), dp(6), dp(4), dp(6))
                 setOnClickListener { customMinInput.setText(mins.toString()) }
@@ -324,7 +319,7 @@ class LockGateActivity : Activity() {
         )
 
         val pwdInput = EditText(this).apply {
-            hint = "Password dalein..."
+            hint = "Enter password..."
             setHintTextColor(Color.parseColor("#94A3B8"))
             setTextColor(Color.WHITE)
             inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
@@ -354,7 +349,7 @@ class LockGateActivity : Activity() {
         card.addView(errorTv)
 
         val unlockBtn = Button(this).apply {
-            text = "Unlock Karein"
+            text = "Unlock Temporarily"
             isAllCaps = false
             setTextColor(Color.WHITE)
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
@@ -368,7 +363,7 @@ class LockGateActivity : Activity() {
                 val entered = pwdInput.text.toString().trim()
                 val rawMins = customMinInput.text.toString().trim().toIntOrNull()
                 if (rawMins == null || rawMins < 1 || rawMins > 45) {
-                    errorTv.text = "Time 1 se 45 minute ke beech dalein."
+                    errorTv.text = "Please enter a duration between 1 and 45 minutes."
                     errorTv.visibility = View.VISIBLE
                     return@setOnClickListener
                 }
@@ -383,7 +378,7 @@ class LockGateActivity : Activity() {
                     ).show()
                     finishAndRemoveTask()
                 } else {
-                    errorTv.text = "Galat password! Sahi password dalein."
+                    errorTv.text = "Wrong password. Try again."
                     errorTv.visibility = View.VISIBLE
                     pwdInput.setText("")
                 }

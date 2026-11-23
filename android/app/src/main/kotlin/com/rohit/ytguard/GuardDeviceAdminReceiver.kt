@@ -6,6 +6,6 @@ import android.content.Intent
 
 class GuardDeviceAdminReceiver : DeviceAdminReceiver() {
     override fun onDisableRequested(context: Context, intent: Intent): CharSequence {
-        return "YT Guard ka Uninstall Shield band karne se pehle Tamper Password verify karna zaroori hai."
+        return "Verify your Tamper Password inside YT Guard before disabling Uninstall Protection."
     }
 }
