@@ -54,12 +54,6 @@ class YouTubeGuardService : AccessibilityService() {
         DISMISS_ONLY
     }
 
-    private enum class WatchVerdict {
-        PENDING,
-        ALLOWED,
-        BLOCKED
-    }
-
     private data class AppLockMatch(
         val lockKey: String,
         val title: String,
@@ -69,7 +63,6 @@ class YouTubeGuardService : AccessibilityService() {
 
     private data class ParsedConfig(
         val shortsBlockEnabled: Boolean,
-        val ytWhitelistEnabled: Boolean,
         val ytBlacklistEnabled: Boolean,
         val tamperShieldEnabled: Boolean,
         val geminiBlockEnabled: Boolean,
@@ -79,8 +72,6 @@ class YouTubeGuardService : AccessibilityService() {
         val tamperPwd: String,
         val appBlockerPwd: String,
         val blockedKeywords: List<String>,
-        val activeGroupName: String,
-        val activeChannels: List<String>,
         val locksByPkg: Map<String, AppLockMatch>,
         val locksByLabel: Map<String, AppLockMatch>
     )
@@ -101,13 +92,9 @@ class YouTubeGuardService : AccessibilityService() {
     private var lastWindowPkg = ""
     private var lastWindowClass = ""
 
-    // YouTube Watch Session Memory (prevents scroll-down & ad-sheet bypass while keeping whitelisted videos smooth)
+    // Keyword Blacklist session memory (prevents scroll / comments / fullscreen bypass on blocked videos)
     private var currentWatchDurationKey = ""
-    private var currentWatchVerdict = WatchVerdict.PENDING
-    private var currentWatchBlockTitle = ""
-    private var currentWatchBlockMsg = ""
-    private var currentWatchStartedAt = 0L
-    private var preApprovedCardUntil = 0L
+    private var currentVideoBlockedWord = ""
 
     private val screenOffReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
@@ -199,15 +186,28 @@ class YouTubeGuardService : AccessibilityService() {
 
     private fun resetWatchSession() {
         currentWatchDurationKey = ""
-        currentWatchVerdict = WatchVerdict.PENDING
-        currentWatchBlockTitle = ""
-        currentWatchBlockMsg = ""
-        currentWatchStartedAt = 0L
+        currentVideoBlockedWord = ""
+    }
+
+    private fun isPackageCurrentlyVisible(targetPkg: String): Boolean {
+        try {
+            val active = rootInActiveWindow?.packageName?.toString()
+            if (active == targetPkg) return true
+            val wins = windows ?: return false
+            for (w in wins) {
+                if (w.type == AccessibilityWindowInfo.TYPE_APPLICATION &&
+                    w.root?.packageName?.toString() == targetPkg
+                ) {
+                    return true
+                }
+            }
+        } catch (_: Exception) {
+        }
+        return false
     }
 
     // =========================================================================
     // 200MS MULTI-WINDOW + YOUTUBE + USAGE SWEEP
-    // Covers Split-Screen, Realme Floating Windows, Clone Apps & Static Screens
     // =========================================================================
     private fun runMultiWindowAndUsageSweep() {
         if (overlayView != null) return
@@ -247,12 +247,12 @@ class YouTubeGuardService : AccessibilityService() {
                     if (checkCompleteGeminiBlock(wPkg, wRoot, cfg, now)) return
                 }
 
-                // 3. Custom App & Category Blocker (Direct Overlay covers Split-Screen & Floating Window)
+                // 3. Custom App & Category Blocker
                 if (cfg.appBlockerEnabled) {
-                    if (checkAndBlockCustomApp(wPkg, wTitle, wRoot, cfg, now)) return
+                    if (checkAndBlockCustomApp(wPkg, wTitle, cfg, now)) return
                 }
 
-                // 4. YouTube Shorts & Watch Session (works even when screen isn't touched or in Split-Screen)
+                // 4. YouTube Shorts & Keyword Blacklist
                 if (wPkg == YOUTUBE_PKG) {
                     youtubeVisible = true
                     if (inspectYouTubeScreen(wRoot, cfg, now)) return
@@ -264,7 +264,7 @@ class YouTubeGuardService : AccessibilityService() {
             resetWatchSession()
         }
 
-        // Fallback via UsageEvents ONLY when Accessibility has no active app window (games / DRM / secure screens)
+        // Fallback via UsageEvents when Accessibility has no active app window (games / secure screens)
         if (!sawActiveAppWindow && (activeRootPkg == null || activeRootPkg == "com.android.systemui")) {
             val topPkg = queryActiveResumedPackage(now) ?: return
             if (isPhonePePackage(topPkg) || isIgnoredSystemPackage(topPkg) || isLauncherPackage(topPkg)) return
@@ -275,7 +275,7 @@ class YouTubeGuardService : AccessibilityService() {
             }
 
             if (cfg.appBlockerEnabled) {
-                checkAndBlockCustomApp(topPkg, "", null, cfg, now)
+                checkAndBlockCustomApp(topPkg, "", cfg, now)
             }
         }
     }
@@ -328,10 +328,10 @@ class YouTubeGuardService : AccessibilityService() {
         // Hard-exempt PhonePe immediately
         if (isPhonePePackage(eventPkg)) return
 
-        // CRITICAL: Never remove overlay when YT Guard's own overlay emits Accessibility events!
+        // Never self-destruct overlay on YT Guard's own events
         if (eventPkg == packageName) return
 
-        // If user swipes to Home screen while a non-home overlay is up, clean it up cleanly
+        // Auto-remove non-home overlay if user swiped back to Home Launcher
         if (overlayView != null) {
             if (isLauncherPackage(eventPkg) &&
                 event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED &&
@@ -366,27 +366,27 @@ class YouTubeGuardService : AccessibilityService() {
 
         val activeTitle = getWindowTitleForPackage(pkg)
 
-        // 1. STAGE 1 MICROSECOND YOUTUBE VIDEO TAP CHECK (Before player opens)
+        // 1. STAGE 1 INSTANT KEYWORD BLACKLIST TAP CHECK (0ms before player opens)
         if (pkg == YOUTUBE_PKG && event.eventType == AccessibilityEvent.TYPE_VIEW_CLICKED) {
-            if (handleYouTubeCardTapInstantCheck(event, cfg, now)) return
+            if (handleYouTubeBlacklistTapCheck(event, cfg, now)) return
         }
 
-        // 2. TAMPER SHIELD (Instant Home + Overlay on Home Screen, zero Recents card)
+        // 2. TAMPER SHIELD (Instant Home + Overlay on Home Screen)
         if (cfg.tamperShieldEnabled && now >= GuardRuntimeState.settingsUnlockExpiry) {
             if (root != null && checkTamperShield(pkg, activeTitle, root, cfg, now)) return
         }
 
-        // 3. COMPLETE 4-WAY GEMINI BLOCKER (Direct Overlay, Google Search untouched)
+        // 3. COMPLETE 4-WAY GEMINI BLOCKER (Direct Overlay, Google Search safe)
         if (isGeminiProtectionEnabled(cfg) && now >= GuardRuntimeState.geminiTempUnlockExpiry) {
             if (checkCompleteGeminiBlock(pkg, root, cfg, now)) return
         }
 
         // 4. CUSTOM APP & CATEGORY BLOCKER (Direct Overlay)
         if (cfg.appBlockerEnabled) {
-            if (checkAndBlockCustomApp(pkg, activeTitle, root, cfg, now)) return
+            if (checkAndBlockCustomApp(pkg, activeTitle, cfg, now)) return
         }
 
-        // 5. YOUTUBE SHORTS & STAGE 2 WATCH SESSION CHECK
+        // 5. YOUTUBE SHORTS & STAGE 2 KEYWORD BLACKLIST CHECK
         if (pkg == YOUTUBE_PKG && root != null) {
             inspectYouTubeScreen(root, cfg, now)
         }
@@ -428,7 +428,7 @@ class YouTubeGuardService : AccessibilityService() {
     }
 
     // =========================================================================
-    // 1. TAMPER SHIELD -> INSTANT HOME + OVERLAY ON HOME (NO SEPARATE APP CARD)
+    // 1. TAMPER SHIELD -> INSTANT HOME + OVERLAY ON HOME
     // =========================================================================
     private fun checkTamperShield(
         pkg: String,
@@ -551,7 +551,8 @@ class YouTubeGuardService : AccessibilityService() {
                 targetKey = targetKey,
                 defaultMinutes = defaultMinutes,
                 exitMode = ExitMode.DISMISS_ONLY,
-                staysOnHome = true
+                staysOnHome = true,
+                requireVisiblePkg = null
             )
         }, 220L)
     }
@@ -715,17 +716,17 @@ class YouTubeGuardService : AccessibilityService() {
             targetKey = GEMINI_PKG,
             defaultMinutes = 15,
             exitMode = if (isStandaloneApp) ExitMode.HOME else ExitMode.BACK,
-            staysOnHome = false
+            staysOnHome = false,
+            requireVisiblePkg = null
         )
     }
 
     // =========================================================================
-    // 3. CUSTOM APP & CATEGORY BLOCKER (DIRECT OVERLAY OVER APP / SPLIT / FLOATING)
+    // 3. CUSTOM APP & CATEGORY BLOCKER (DIRECT OVERLAY, PHONEPE EXEMPT)
     // =========================================================================
     private fun checkAndBlockCustomApp(
         pkg: String,
         windowTitle: String,
-        root: AccessibilityNodeInfo?,
         cfg: ParsedConfig,
         now: Long
     ): Boolean {
@@ -739,8 +740,6 @@ class YouTubeGuardService : AccessibilityService() {
         val unlockUntil = GuardRuntimeState.appUnlockExpiry[lockMatch.lockKey] ?: 0L
         if (now < unlockUntil) return false
 
-        // If user locked Settings app AND opened a restricted Settings sub-page (where Android hides overlays),
-        // kick directly to Home first and show Overlay there.
         val lowerPkg = pkg.lowercase(Locale.ROOT)
         val lowerTitle = windowTitle.trim().lowercase(Locale.ROOT)
         val isRestrictedSettingsPage = (lowerPkg.contains("settings") || lowerPkg.contains("appdetail")) && (
@@ -764,8 +763,6 @@ class YouTubeGuardService : AccessibilityService() {
             return true
         }
 
-        // For ALL other apps (Play Store, YouTube, Social, Games, Split-Screen, Floating Window):
-        // Show Direct Full-Screen System Overlay right on top (no extra YT Guard app!)
         stopAllMediaPlayback()
         showOverlayPopup(
             tag = tag,
@@ -777,7 +774,8 @@ class YouTubeGuardService : AccessibilityService() {
             targetKey = lockMatch.lockKey,
             defaultMinutes = 15,
             exitMode = ExitMode.HOME,
-            staysOnHome = false
+            staysOnHome = false,
+            requireVisiblePkg = null
         )
         return true
     }
@@ -800,14 +798,14 @@ class YouTubeGuardService : AccessibilityService() {
     }
 
     // =========================================================================
-    // 4. YOUTUBE: STAGE 1 INSTANT TAP CHECK + SHORTS + STAGE 2 SESSION MEMORY
+    // 4. YOUTUBE: SHORTS BLOCKER + KEYWORD BLACKLIST (NO CHANNEL FILTER)
     // =========================================================================
-    private fun handleYouTubeCardTapInstantCheck(
+    private fun handleYouTubeBlacklistTapCheck(
         event: AccessibilityEvent,
         cfg: ParsedConfig,
         now: Long
     ): Boolean {
-        if (!cfg.ytWhitelistEnabled && !cfg.ytBlacklistEnabled) return false
+        if (!cfg.ytBlacklistEnabled || cfg.blockedKeywords.isEmpty()) return false
         if (now < GuardRuntimeState.ytVideoTempUnlockExpiry) return false
         if (isTagInCooldown("yt_video", now)) return false
 
@@ -829,102 +827,58 @@ class YouTubeGuardService : AccessibilityService() {
         }
 
         var cardNode: AccessibilityNodeInfo? = src
+        var insideFeedList = false
         var steps = 0
-        while (cardNode != null && steps < 4) {
+        while (cardNode != null && steps < 5) {
             val parent = cardNode.parent ?: break
             val pid = parent.viewIdResourceName?.lowercase(Locale.ROOT) ?: ""
             if (pid.endsWith("results") || pid.endsWith("watch_list") || pid.contains("view_pager")) {
+                insideFeedList = true
                 break
             }
             cardNode = parent
             steps++
         }
-        if (cardNode == null) return false
+        if (!insideFeedList || cardNode == null) return false
 
         val cardTexts = ArrayList<String>()
         val cardIds = ArrayList<String>()
         collectNodeTree(cardNode, cardTexts, cardIds) {}
-
-        val lowerCard = cardTexts.map { it.lowercase(Locale.ROOT) }
-        val joined = lowerCard.joinToString(" | ")
+        val joined = cardTexts.joinToString(" | ").lowercase(Locale.ROOT)
 
         if (joined.contains("sponsored")) return false
-        var channelName = ""
-        for (t in lowerCard) {
-            if (t.startsWith("go to channel ")) {
-                channelName = t.removePrefix("go to channel ").trim()
-                break
-            }
-        }
-        val looksLikeVideoCard = channelName.isNotEmpty() ||
-            (joined.contains(" views") && (joined.contains("ago") || joined.contains("minutes") || joined.contains("seconds")))
 
-        if (!looksLikeVideoCard) return false
+        val blockedWord = findMatchedBlockedKeyword(joined, cfg) ?: return false
 
-        // Stage 1 Blacklist check (0ms)
-        if (cfg.ytBlacklistEnabled) {
-            val blockedWord = findMatchedBlockedKeyword(joined, cfg)
-            if (blockedWord != null) {
-                currentWatchVerdict = WatchVerdict.BLOCKED
-                currentWatchBlockTitle = "Blocked Keyword Mila"
-                currentWatchBlockMsg = "Is video mein blocked shabd \"$blockedWord\" mila hai. Pichhle page par wapas jayein."
-                stopAllMediaPlayback()
-                showOverlayPopup(
-                    tag = "yt_video",
-                    badge = "YT GUARD • VIDEO BLOCKED",
-                    title = currentWatchBlockTitle,
-                    message = currentWatchBlockMsg,
-                    expectedPassword = cfg.ytAdminPwd,
-                    unlockType = "yt_video",
-                    targetKey = "yt_video",
-                    defaultMinutes = 15,
-                    exitMode = ExitMode.BACK_YOUTUBE,
-                    staysOnHome = false
-                )
-                return true
-            }
-        }
-
-        // Stage 1 Whitelist check (0ms)
-        if (cfg.ytWhitelistEnabled) {
-            val targetText = if (channelName.isNotEmpty()) "$channelName | $joined" else joined
-            if (matchesActiveWhitelist(targetText, cfg)) {
-                preApprovedCardUntil = now + 4000L
-                return false
-            } else {
-                currentWatchVerdict = WatchVerdict.BLOCKED
-                currentWatchBlockTitle = "Alag Category Ki Video"
-                currentWatchBlockMsg = "Ye video aapki active category [${cfg.activeGroupName}] mein nahi hai. Pichhle page par wapas jayein ya password se unlock karein."
-                stopAllMediaPlayback()
-                showOverlayPopup(
-                    tag = "yt_video",
-                    badge = "YT GUARD • CATEGORY LOCK",
-                    title = currentWatchBlockTitle,
-                    message = currentWatchBlockMsg,
-                    expectedPassword = cfg.ytAdminPwd,
-                    unlockType = "yt_video",
-                    targetKey = "yt_video",
-                    defaultMinutes = 15,
-                    exitMode = ExitMode.BACK_YOUTUBE,
-                    staysOnHome = false
-                )
-                return true
-            }
-        }
-
-        return false
+        currentVideoBlockedWord = blockedWord
+        stopAllMediaPlayback()
+        showOverlayPopup(
+            tag = "yt_video",
+            badge = "YT GUARD • VIDEO BLOCKED",
+            title = "Blocked Keyword Mila",
+            message = "Is video mein blocked shabd \"$blockedWord\" mila hai. Pichhle page par wapas jayein.",
+            expectedPassword = cfg.ytAdminPwd,
+            unlockType = "yt_video",
+            targetKey = "yt_video",
+            defaultMinutes = 15,
+            exitMode = ExitMode.BACK_YOUTUBE,
+            staysOnHome = false,
+            requireVisiblePkg = YOUTUBE_PKG
+        )
+        return true
     }
 
     private fun inspectYouTubeScreen(root: AccessibilityNodeInfo, cfg: ParsedConfig, now: Long): Boolean {
-        if (!cfg.shortsBlockEnabled && !cfg.ytWhitelistEnabled && !cfg.ytBlacklistEnabled) return false
+        if (!cfg.shortsBlockEnabled && !cfg.ytBlacklistEnabled) return false
 
         val allViewIds = HashSet<String>()
         var hasMiniplayer = false
         var hasSearchBoxFocused = false
         var watchListNode: AccessibilityNodeInfo? = null
+        var shortsFooterNode: AccessibilityNodeInfo? = null
         var detectedDurationKey = ""
 
-        collectNodeIdsAndWatchNode(root, allViewIds) { node ->
+        collectNodeIdsAndTargets(root, allViewIds) { node ->
             val id = node.viewIdResourceName?.lowercase(Locale.ROOT) ?: ""
             val desc = node.contentDescription?.toString()?.lowercase(Locale.ROOT) ?: ""
 
@@ -936,6 +890,9 @@ class YouTubeGuardService : AccessibilityService() {
             }
             if (id.endsWith("watch_list") && watchListNode == null) {
                 watchListNode = node
+            }
+            if (id.endsWith("reel_player_footer_container") && shortsFooterNode == null) {
+                shortsFooterNode = node
             }
             if (detectedDurationKey.isEmpty() && desc.contains(" of ")) {
                 val cls = node.className?.toString() ?: ""
@@ -950,22 +907,22 @@ class YouTubeGuardService : AccessibilityService() {
 
         if (hasSearchBoxFocused) return false
 
-        // A. EXACT SHORTS PLAYER CHECK (Ignores stale reel_time_bar)
-        if (cfg.shortsBlockEnabled &&
-            now >= GuardRuntimeState.shortsTempUnlockExpiry &&
-            !isTagInCooldown("yt_shorts", now)
-        ) {
-            val isTrueShortsPlayer = allViewIds.any { id ->
-                id.endsWith("reel_watch_fragment_root") ||
-                id.endsWith("reel_watch_player") ||
-                id.endsWith("reel_recycler") ||
-                id.endsWith("reel_player_overlay_root") ||
-                id.endsWith("reel_player_page_container") ||
-                id.endsWith("reel_video_interactions")
-            }
+        val isTrueShortsPlayer = allViewIds.any { id ->
+            id.endsWith("reel_watch_fragment_root") ||
+            id.endsWith("reel_watch_player") ||
+            id.endsWith("reel_recycler") ||
+            id.endsWith("reel_player_overlay_root") ||
+            id.endsWith("reel_player_page_container") ||
+            id.endsWith("reel_video_interactions")
+        }
 
-            if (isTrueShortsPlayer) {
-                resetWatchSession()
+        // A. SHORTS BLOCKER (Ignores stale reel_time_bar)
+        if (isTrueShortsPlayer) {
+            resetWatchSession()
+            if (cfg.shortsBlockEnabled &&
+                now >= GuardRuntimeState.shortsTempUnlockExpiry &&
+                !isTagInCooldown("yt_shorts", now)
+            ) {
                 stopAllMediaPlayback()
                 showOverlayPopup(
                     tag = "yt_shorts",
@@ -977,14 +934,47 @@ class YouTubeGuardService : AccessibilityService() {
                     targetKey = "shorts",
                     defaultMinutes = 15,
                     exitMode = ExitMode.BACK_YOUTUBE,
-                    staysOnHome = false
+                    staysOnHome = false,
+                    requireVisiblePkg = YOUTUBE_PKG
                 )
                 return true
             }
+
+            // If Shorts Blocker is OFF but Keyword Blacklist is ON, check Short's title too
+            if (cfg.ytBlacklistEnabled &&
+                cfg.blockedKeywords.isNotEmpty() &&
+                now >= GuardRuntimeState.ytVideoTempUnlockExpiry &&
+                !isTagInCooldown("yt_video", now) &&
+                shortsFooterNode != null
+            ) {
+                val footerTexts = ArrayList<String>()
+                val dummyIds = ArrayList<String>()
+                collectNodeTree(shortsFooterNode, footerTexts, dummyIds) {}
+                val joinedFooter = footerTexts.joinToString(" | ").lowercase(Locale.ROOT)
+                val blockedWord = findMatchedBlockedKeyword(joinedFooter, cfg)
+                if (blockedWord != null) {
+                    stopAllMediaPlayback()
+                    showOverlayPopup(
+                        tag = "yt_video",
+                        badge = "YT GUARD • VIDEO BLOCKED",
+                        title = "Blocked Keyword Mila",
+                        message = "Is Short mein blocked shabd \"$blockedWord\" mila hai. Pichhle page par wapas jayein.",
+                        expectedPassword = cfg.ytAdminPwd,
+                        unlockType = "yt_video",
+                        targetKey = "yt_video",
+                        defaultMinutes = 15,
+                        exitMode = ExitMode.BACK_YOUTUBE,
+                        staysOnHome = false,
+                        requireVisiblePkg = YOUTUBE_PKG
+                    )
+                    return true
+                }
+            }
+            return false
         }
 
-        // B. STAGE 2 WATCH PAGE CHECK WITH SESSION MEMORY
-        if (!cfg.ytWhitelistEnabled && !cfg.ytBlacklistEnabled) return false
+        // B. STAGE 2 KEYWORD BLACKLIST ON WATCH PAGE
+        if (!cfg.ytBlacklistEnabled || cfg.blockedKeywords.isEmpty()) return false
         if (now < GuardRuntimeState.ytVideoTempUnlockExpiry) return false
         if (isTagInCooldown("yt_video", now)) return false
 
@@ -995,21 +985,19 @@ class YouTubeGuardService : AccessibilityService() {
             id.endsWith("tabs_bar_view")
         }
 
-        // Left Watch Page -> reset session memory cleanly
         if (hasBrowseOrSearch || hasMiniplayer) {
             resetWatchSession()
             return false
         }
 
         val hasWatchPlayer = allViewIds.any { id ->
-            id.endsWith("watch_player") || id.endsWith("watch_while_time_bar_view")
+            id.endsWith("watch_player") ||
+            id.endsWith("watch_while_time_bar_view") ||
+            id.endsWith("fullscreen_mode_container")
         }
-        val hasMetadataContainer = allViewIds.any { id ->
-            id.endsWith("video_metadata_layout") || id.endsWith("watch_list")
-        }
-        val isTrueWatchPage = hasWatchPlayer && hasMetadataContainer
+        if (!hasWatchPlayer) return false
 
-        // Detect new video via SeekBar total duration change (even on Autoplay Next!)
+        // Detect new video via SeekBar duration change
         if (detectedDurationKey.isNotEmpty()) {
             if (currentWatchDurationKey.isNotEmpty() && detectedDurationKey != currentWatchDurationKey) {
                 resetWatchSession()
@@ -1017,142 +1005,51 @@ class YouTubeGuardService : AccessibilityService() {
             currentWatchDurationKey = detectedDurationKey
         }
 
-        if (!isTrueWatchPage) {
-            // If in fullscreen landscape of an ALREADY ALLOWED video, do nothing
-            return false
-        }
-
-        if (currentWatchStartedAt == 0L) {
-            currentWatchStartedAt = now
-        }
-
-        // If card tap already verified this whitelisted video, approve session immediately
-        if (currentWatchVerdict == WatchVerdict.PENDING && now < preApprovedCardUntil) {
-            currentWatchVerdict = WatchVerdict.ALLOWED
-            preApprovedCardUntil = 0L
-        }
-
-        // If this video session was ALREADY marked BLOCKED (even if user scrolled or opened Ad Sheet), keep it blocked!
-        if (currentWatchVerdict == WatchVerdict.BLOCKED) {
+        // Keep blocked video locked even if user scrolls down, opens Comments, or enters Fullscreen
+        if (currentVideoBlockedWord.isNotEmpty()) {
             stopAllMediaPlayback()
             showOverlayPopup(
                 tag = "yt_video",
                 badge = "YT GUARD • VIDEO BLOCKED",
-                title = currentWatchBlockTitle.ifEmpty { "Video Blocked Hai" },
-                message = currentWatchBlockMsg.ifEmpty { "Ye video aapki active rules ke hisaab se blocked hai." },
+                title = "Blocked Keyword Mila",
+                message = "Is video mein blocked shabd \"$currentVideoBlockedWord\" mila hai. Pichhle page par wapas jayein.",
                 expectedPassword = cfg.ytAdminPwd,
                 unlockType = "yt_video",
                 targetKey = "yt_video",
                 defaultMinutes = 15,
                 exitMode = ExitMode.BACK_YOUTUBE,
-                staysOnHome = false
+                staysOnHome = false,
+                requireVisiblePkg = YOUTUBE_PKG
             )
             return true
         }
 
-        // Inspect visible top header of watch_list (stops before Comments & Sponsored ads)
-        val wl = watchListNode
+        val wl = watchListNode ?: return false
         val headerTexts = ArrayList<String>()
-        var hasChannelMarker = false
-        var hitLowerSection = false
-
-        if (wl != null) {
-            collectWatchHeaderOnly(wl, headerTexts) { lowerText ->
-                if (lowerText == "comments" || lowerText == "sponsored" || lowerText.startsWith("sponsored –")) {
-                    hitLowerSection = true
-                    return@collectWatchHeaderOnly true
-                }
-                if (lowerText.startsWith("subscribe to ") ||
-                    lowerText.contains(" subscribers") ||
-                    lowerText == "subscribe" ||
-                    lowerText == "subscribed" ||
-                    lowerText.startsWith("@")
-                ) {
-                    hasChannelMarker = true
-                }
-                hitLowerSection
-            }
+        collectWatchHeaderOnly(wl, headerTexts) { lowerText ->
+            lowerText == "comments" || lowerText == "sponsored" || lowerText.startsWith("sponsored –")
         }
+        if (headerTexts.isEmpty()) return false
 
         val combinedHeader = headerTexts.joinToString(" | ").lowercase(Locale.ROOT)
+        val blockedWord = findMatchedBlockedKeyword(combinedHeader, cfg) ?: return false
 
-        // Blacklist check whenever header text is visible (even if card was pre-approved with truncated title)
-        if (cfg.ytBlacklistEnabled && combinedHeader.isNotEmpty()) {
-            val blockedWord = findMatchedBlockedKeyword(combinedHeader, cfg)
-            if (blockedWord != null) {
-                currentWatchVerdict = WatchVerdict.BLOCKED
-                currentWatchBlockTitle = "Blocked Keyword Mila"
-                currentWatchBlockMsg = "Is video mein blocked shabd \"$blockedWord\" mila hai. Pichhle page par wapas jayein."
-                stopAllMediaPlayback()
-                showOverlayPopup(
-                    tag = "yt_video",
-                    badge = "YT GUARD • VIDEO BLOCKED",
-                    title = currentWatchBlockTitle,
-                    message = currentWatchBlockMsg,
-                    expectedPassword = cfg.ytAdminPwd,
-                    unlockType = "yt_video",
-                    targetKey = "yt_video",
-                    defaultMinutes = 15,
-                    exitMode = ExitMode.BACK_YOUTUBE,
-                    staysOnHome = false
-                )
-                return true
-            }
-        }
-
-        // Once ALLOWED, scrolling down to comments / opening ads / fullscreen will NEVER disturb this video!
-        if (currentWatchVerdict == WatchVerdict.ALLOWED) {
-            return false
-        }
-
-        // Whitelist verification when PENDING
-        if (cfg.ytWhitelistEnabled) {
-            if (hasChannelMarker && combinedHeader.isNotEmpty()) {
-                if (matchesActiveWhitelist(combinedHeader, cfg)) {
-                    currentWatchVerdict = WatchVerdict.ALLOWED
-                    return false
-                } else {
-                    currentWatchVerdict = WatchVerdict.BLOCKED
-                    currentWatchBlockTitle = "Alag Category Ki Video"
-                    currentWatchBlockMsg = "Ye video aapki active category [${cfg.activeGroupName}] mein nahi hai. Pichhle page par wapas jayein ya password se unlock karein."
-                    stopAllMediaPlayback()
-                    showOverlayPopup(
-                        tag = "yt_video",
-                        badge = "YT GUARD • CATEGORY LOCK",
-                        title = currentWatchBlockTitle,
-                        message = currentWatchBlockMsg,
-                        expectedPassword = cfg.ytAdminPwd,
-                        unlockType = "yt_video",
-                        targetKey = "yt_video",
-                        defaultMinutes = 15,
-                        exitMode = ExitMode.BACK_YOUTUBE,
-                        staysOnHome = false
-                    )
-                    return true
-                }
-            } else if (now - currentWatchStartedAt >= 800L) {
-                // Ad-Sheet or fast scroll hid channel metadata before verification -> block bypass!
-                stopAllMediaPlayback()
-                showOverlayPopup(
-                    tag = "yt_video",
-                    badge = "YT GUARD • VERIFY REQUIRED",
-                    title = "Channel Verify Nahi Hua",
-                    message = "Ad sheet ya scroll ki wajah se is video ka channel verify nahi ho paya. Pichhle page par wapas jayein ya password dalein.",
-                    expectedPassword = cfg.ytAdminPwd,
-                    unlockType = "yt_video",
-                    targetKey = "yt_video",
-                    defaultMinutes = 15,
-                    exitMode = ExitMode.BACK_YOUTUBE,
-                    staysOnHome = false
-                )
-                return true
-            }
-        } else if (cfg.ytBlacklistEnabled && hasChannelMarker) {
-            // Blacklist-only mode: header was checked and clean -> allow smooth scrolling
-            currentWatchVerdict = WatchVerdict.ALLOWED
-        }
-
-        return false
+        currentVideoBlockedWord = blockedWord
+        stopAllMediaPlayback()
+        showOverlayPopup(
+            tag = "yt_video",
+            badge = "YT GUARD • VIDEO BLOCKED",
+            title = "Blocked Keyword Mila",
+            message = "Is video mein blocked shabd \"$blockedWord\" mila hai. Pichhle page par wapas jayein.",
+            expectedPassword = cfg.ytAdminPwd,
+            unlockType = "yt_video",
+            targetKey = "yt_video",
+            defaultMinutes = 15,
+            exitMode = ExitMode.BACK_YOUTUBE,
+            staysOnHome = false,
+            requireVisiblePkg = YOUTUBE_PKG
+        )
+        return true
     }
 
     private fun findMatchedBlockedKeyword(text: String, cfg: ParsedConfig): String? {
@@ -1160,13 +1057,6 @@ class YouTubeGuardService : AccessibilityService() {
             if (text.contains(word)) return word
         }
         return null
-    }
-
-    private fun matchesActiveWhitelist(text: String, cfg: ParsedConfig): Boolean {
-        for (ch in cfg.activeChannels) {
-            if (text.contains(ch)) return true
-        }
-        return false
     }
 
     private fun collectWatchHeaderOnly(
@@ -1198,7 +1088,7 @@ class YouTubeGuardService : AccessibilityService() {
     }
 
     // =========================================================================
-    // 5. STABLE FULL-SCREEN SYSTEM OVERLAY (COVERS APPS, SPLIT-SCREEN & FLOATING)
+    // 5. STABLE FULL-SCREEN SYSTEM OVERLAY
     // =========================================================================
     private inner class BlockerOverlayLayout(context: Context) : LinearLayout(context) {
         override fun dispatchKeyEvent(event: KeyEvent?): Boolean {
@@ -1219,10 +1109,16 @@ class YouTubeGuardService : AccessibilityService() {
         targetKey: String,
         defaultMinutes: Int,
         exitMode: ExitMode,
-        staysOnHome: Boolean
+        staysOnHome: Boolean,
+        requireVisiblePkg: String?
     ) {
         handler.post {
             try {
+                // Prevent late YouTube pop-up on Home Screen if user already left YouTube
+                if (requireVisiblePkg != null && !isPackageCurrentlyVisible(requireVisiblePkg)) {
+                    return@post
+                }
+
                 if (overlayView != null && activeOverlayTag == tag) return@post
                 removeOverlay()
 
@@ -1308,7 +1204,6 @@ class YouTubeGuardService : AccessibilityService() {
                     setOnClickListener {
                         setTagCooldown(tag, 1800L)
                         if (exitMode == ExitMode.BACK_YOUTUBE) {
-                            resetWatchSession()
                             stopAllMediaPlayback()
                         }
                         removeOverlay()
@@ -1537,7 +1432,7 @@ class YouTubeGuardService : AccessibilityService() {
     }
 
     // =========================================================================
-    // RAM CONFIG CACHE (ZERO JSON PARSING PER EVENT)
+    // RAM CONFIG CACHE
     // =========================================================================
     private fun getCachedConfig(): ParsedConfig? {
         val currentVersion = GuardRuntimeState.configVersion
@@ -1572,34 +1467,6 @@ class YouTubeGuardService : AccessibilityService() {
                 for (i in 0 until kwArr.length()) {
                     val w = kwArr.optString(i, "").trim().lowercase(Locale.ROOT)
                     if (w.isNotEmpty()) keywords.add(w)
-                }
-            }
-
-            val activeId = json.optString("activeGroupId", "study")
-            var activeGroupName = "Active Category"
-            val activeChannels = ArrayList<String>()
-            val groupsArr = json.optJSONArray("groups")
-            if (groupsArr != null) {
-                var activeObj: JSONObject? = null
-                for (i in 0 until groupsArr.length()) {
-                    val g = groupsArr.optJSONObject(i) ?: continue
-                    if (g.optString("id") == activeId) {
-                        activeObj = g
-                        break
-                    }
-                }
-                if (activeObj == null && groupsArr.length() > 0) {
-                    activeObj = groupsArr.optJSONObject(0)
-                }
-                if (activeObj != null) {
-                    activeGroupName = activeObj.optString("name", "Active Category")
-                    val chArr = activeObj.optJSONArray("channels")
-                    if (chArr != null) {
-                        for (i in 0 until chArr.length()) {
-                            val ch = chArr.optString(i, "").trim().lowercase(Locale.ROOT)
-                            if (ch.isNotEmpty()) activeChannels.add(ch)
-                        }
-                    }
                 }
             }
 
@@ -1655,7 +1522,6 @@ class YouTubeGuardService : AccessibilityService() {
 
             ParsedConfig(
                 shortsBlockEnabled = json.optBoolean("shortsBlockEnabled", false),
-                ytWhitelistEnabled = json.optBoolean("ytWhitelistEnabled", false),
                 ytBlacklistEnabled = json.optBoolean("ytBlacklistEnabled", false),
                 tamperShieldEnabled = json.optBoolean("tamperShieldEnabled", false),
                 geminiBlockEnabled = json.optBoolean("geminiBlockEnabled", false),
@@ -1665,8 +1531,6 @@ class YouTubeGuardService : AccessibilityService() {
                 tamperPwd = tamperPwd,
                 appBlockerPwd = appBlockerPwd,
                 blockedKeywords = keywords,
-                activeGroupName = activeGroupName,
-                activeChannels = activeChannels,
                 locksByPkg = locksByPkg,
                 locksByLabel = locksByLabel
             )
@@ -1744,7 +1608,7 @@ class YouTubeGuardService : AccessibilityService() {
         return false
     }
 
-    private fun collectNodeIdsAndWatchNode(
+    private fun collectNodeIdsAndTargets(
         node: AccessibilityNodeInfo?,
         ids: MutableSet<String>,
         inspector: (AccessibilityNodeInfo) -> Unit
@@ -1753,7 +1617,7 @@ class YouTubeGuardService : AccessibilityService() {
         inspector(node)
         node.viewIdResourceName?.takeIf { it.isNotBlank() }?.let { ids.add(it.lowercase(Locale.ROOT)) }
         for (i in 0 until node.childCount) {
-            collectNodeIdsAndWatchNode(node.getChild(i), ids, inspector)
+            collectNodeIdsAndTargets(node.getChild(i), ids, inspector)
         }
     }
 

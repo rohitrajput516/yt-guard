@@ -40,12 +40,10 @@ class GuardBridge {
   static JsonMap defaultConfig() {
     return {
       'shortsBlockEnabled': false,
-      'ytWhitelistEnabled': false,
       'ytBlacklistEnabled': false,
       'tamperShieldEnabled': false,
       'geminiBlockEnabled': false,
       'appBlockerEnabled': false,
-      'activeGroupId': 'study',
       'passwords': {
         'master': '0000',
         'shorts': '2222',
@@ -54,18 +52,6 @@ class GuardBridge {
         'appBlocker': '5555',
       },
       'blockedTitleKeywords': ['vlog', 'roast', 'prank', 'gossip', 'controversy'],
-      'groups': [
-        {
-          'id': 'study',
-          'name': 'B.Sc & Defence Study',
-          'channels': ['Physics Wallah', 'Defence Wallah', 'Maths Jugad Se'],
-        },
-        {
-          'id': 'coding',
-          'name': 'Coding & Dev',
-          'channels': ['CodeWithHarry', 'Hitesh Choudhary', 'Fireship'],
-        },
-      ],
       'appCategories': <JsonMap>[],
       'individualLockedApps': <JsonMap>[],
     };
@@ -391,7 +377,7 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
     final pages = [
       _buildControlsTab(),
       _buildAppBlockerTab(),
-      _buildYoutubeAndPasswordsTab(),
+      _buildKeywordsAndPasswordsTab(),
     ];
 
     return Scaffold(
@@ -416,7 +402,7 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
         destinations: const [
           NavigationDestination(icon: Icon(Icons.tune), label: 'Controls'),
           NavigationDestination(icon: Icon(Icons.apps_outlined), label: 'App Lock'),
-          NavigationDestination(icon: Icon(Icons.vpn_key_outlined), label: 'YT & Passwords'),
+          NavigationDestination(icon: Icon(Icons.vpn_key_outlined), label: 'Keywords & Pass'),
         ],
       ),
     );
@@ -537,17 +523,6 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
             configKey: 'shortsBlockEnabled',
             slotKey: 'shorts',
             featureName: 'Shorts Blocker',
-            newValue: v,
-          ),
-        ),
-        _featureSwitchTile(
-          title: 'YouTube Category / Channel Filter',
-          subtitle: 'Video tap hote hi microsecond check, feed/search safe rahega',
-          value: _cfg['ytWhitelistEnabled'] == true,
-          onChanged: (v) => _toggleFeatureWithPassword(
-            configKey: 'ytWhitelistEnabled',
-            slotKey: 'ytAdmin',
-            featureName: 'Category Filter',
             newValue: v,
           ),
         ),
@@ -988,11 +963,7 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
     );
   }
 
-  Widget _buildYoutubeAndPasswordsTab() {
-    final groups = (_cfg['groups'] as List)
-        .map((e) => JsonMap.from(e as Map))
-        .toList();
-    final activeId = (_cfg['activeGroupId'] ?? 'study').toString();
+  Widget _buildKeywordsAndPasswordsTab() {
     final keywords = List<String>.from(_cfg['blockedTitleKeywords'] ?? []);
 
     return ListView(
@@ -1002,86 +973,21 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
           mainAxisAlignment: MainAxisAlignment.spaceBetween,
           children: [
             const Text(
-              'YouTube Active Category',
-              style: TextStyle(fontWeight: FontWeight.bold, fontSize: 15),
-            ),
-            TextButton(
-              onPressed: _createYouTubeCategory,
-              child: const Text('+ Nayi Category'),
-            ),
-          ],
-        ),
-        const SizedBox(height: 6),
-        ...groups.asMap().entries.map((entry) {
-          final idx = entry.key;
-          final g = entry.value;
-          final isSelected = g['id'] == activeId;
-          final chs = List<String>.from(g['channels'] ?? []);
-          return Container(
-            margin: const EdgeInsets.only(bottom: 10),
-            padding: const EdgeInsets.all(10),
-            decoration: BoxDecoration(
-              borderRadius: BorderRadius.circular(12),
-              border: Border.all(
-                color: isSelected
-                    ? Theme.of(context).colorScheme.primary
-                    : Theme.of(context).dividerColor,
-              ),
-            ),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                ListTile(
-                  contentPadding: EdgeInsets.zero,
-                  onTap: () async {
-                    if (!isSelected && await _verifySlotPassword('ytAdmin', 'Category Badlein')) {
-                      _cfg['activeGroupId'] = g['id'];
-                      await _save();
-                    }
-                  },
-                  title: Text(g['name'] ?? '', style: const TextStyle(fontWeight: FontWeight.w600)),
-                  leading: Icon(
-                    isSelected ? Icons.radio_button_checked : Icons.radio_button_off,
-                    color: isSelected ? Theme.of(context).colorScheme.primary : null,
-                  ),
-                  trailing: IconButton(
-                    icon: const Icon(Icons.add),
-                    tooltip: 'Add Channel',
-                    onPressed: () => _addChannelToGroup(idx),
-                  ),
-                ),
-                Wrap(
-                  spacing: 6,
-                  runSpacing: 4,
-                  children: chs
-                      .map((ch) => Chip(
-                            label: Text(ch, style: const TextStyle(fontSize: 12)),
-                            onDeleted: () async {
-                              if (await _verifySlotPassword('ytAdmin', 'Channel Hatayein')) {
-                                ((_cfg['groups'] as List)[idx]['channels'] as List).remove(ch);
-                                await _save();
-                              }
-                            },
-                          ))
-                      .toList(),
-                ),
-              ],
-            ),
-          );
-        }),
-        const SizedBox(height: 12),
-        Row(
-          mainAxisAlignment: MainAxisAlignment.spaceBetween,
-          children: [
-            const Text(
-              'Blocked Title Keywords',
+              'YouTube Blocked Title Keywords',
               style: TextStyle(fontWeight: FontWeight.bold, fontSize: 15),
             ),
             TextButton(onPressed: _addBlockedKeyword, child: const Text('+ Add Word')),
           ],
         ),
+        const SizedBox(height: 6),
+        if (keywords.isEmpty)
+          const Padding(
+            padding: EdgeInsets.symmetric(vertical: 8),
+            child: Text('Abhi koi blocked keyword add nahi hai.'),
+          ),
         Wrap(
           spacing: 8,
+          runSpacing: 4,
           children: keywords
               .map((w) => Chip(
                     label: Text(w),
@@ -1102,7 +1008,7 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
         const SizedBox(height: 8),
         _passwordTile('Master App Access Password', 'master'),
         _passwordTile('Shorts Blocker Password', 'shorts'),
-        _passwordTile('YouTube Category / Admin Password', 'ytAdmin'),
+        _passwordTile('YouTube Keyword Blocker Password', 'ytAdmin'),
         _passwordTile('Settings Tamper Shield Password', 'tamper'),
         _passwordTile('App / Gemini Blocker Password', 'appBlocker'),
       ],
@@ -1148,70 +1054,6 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
           ),
         );
       },
-    );
-  }
-
-  Future<void> _createYouTubeCategory() async {
-    if (!await _verifySlotPassword('ytAdmin', 'Nayi Category Banayein')) return;
-    final ctrl = TextEditingController();
-    if (!mounted) return;
-    await showDialog(
-      context: context,
-      builder: (ctx) => AlertDialog(
-        title: const Text('Nayi YouTube Category'),
-        content: TextField(
-          controller: ctrl,
-          decoration: const InputDecoration(labelText: 'Category Name (e.g. NDA Maths)'),
-        ),
-        actions: [
-          TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Cancel')),
-          FilledButton(
-            onPressed: () async {
-              final name = ctrl.text.trim();
-              if (name.isNotEmpty) {
-                (_cfg['groups'] as List).add({
-                  'id': 'grp_${DateTime.now().millisecondsSinceEpoch}',
-                  'name': name,
-                  'channels': <String>[],
-                });
-                await _save();
-                if (ctx.mounted) Navigator.pop(ctx);
-              }
-            },
-            child: const Text('Create'),
-          ),
-        ],
-      ),
-    );
-  }
-
-  Future<void> _addChannelToGroup(int groupIdx) async {
-    if (!await _verifySlotPassword('ytAdmin', 'Channel Add Karein')) return;
-    final ctrl = TextEditingController();
-    if (!mounted) return;
-    await showDialog(
-      context: context,
-      builder: (ctx) => AlertDialog(
-        title: const Text('Whitelist Channel Add Karein'),
-        content: TextField(
-          controller: ctrl,
-          decoration: const InputDecoration(labelText: 'Channel ka naam ya @handle'),
-        ),
-        actions: [
-          TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Cancel')),
-          FilledButton(
-            onPressed: () async {
-              final ch = ctrl.text.trim();
-              if (ch.isNotEmpty) {
-                ((_cfg['groups'] as List)[groupIdx]['channels'] as List).add(ch);
-                await _save();
-                if (ctx.mounted) Navigator.pop(ctx);
-              }
-            },
-            child: const Text('Add'),
-          ),
-        ],
-      ),
     );
   }
 
