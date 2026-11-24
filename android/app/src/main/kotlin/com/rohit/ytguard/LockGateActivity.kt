@@ -7,6 +7,7 @@ import android.graphics.Color
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.os.Bundle
+import android.text.InputFilter
 import android.text.InputType
 import android.util.TypedValue
 import android.view.Gravity
@@ -270,6 +271,7 @@ class LockGateActivity : Activity() {
             setTextColor(Color.WHITE)
             gravity = Gravity.CENTER
             inputType = InputType.TYPE_CLASS_NUMBER
+            filters = arrayOf(InputFilter.LengthFilter(2))
             setPadding(dp(8), dp(8), dp(8), dp(8))
             background = GradientDrawable().apply {
                 setColor(Color.parseColor("#0F172A"))
@@ -295,7 +297,11 @@ class LockGateActivity : Activity() {
                     setStroke(dp(1), Color.parseColor("#334155"))
                 }
                 setPadding(dp(4), dp(6), dp(4), dp(6))
-                setOnClickListener { customMinInput.setText(mins.toString()) }
+                setOnClickListener {
+                    val txt = mins.toString()
+                    customMinInput.setText(txt)
+                    customMinInput.setSelection(txt.length)
+                }
             }
         }
 

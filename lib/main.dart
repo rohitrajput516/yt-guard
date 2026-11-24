@@ -218,7 +218,7 @@ const List<_FeatureMeta> _allFeatures = [
     key: 'tamperShieldEnabled',
     shortName: 'Tamper Shield',
     title: 'Settings Tamper Shield',
-    subtitle: 'Redirects App Info, Uninstall & Accessibility to Home screen',
+    subtitle: 'Blocks App Info, Uninstall, Hide YT Guard & Accessibility',
     slotKey: 'tamper',
     icon: Icons.admin_panel_settings_rounded,
   ),
@@ -1193,14 +1193,16 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
                         icon: const Icon(Icons.delete_outline_rounded, size: 20),
                         tooltip: 'Delete Category',
                         onPressed: () async {
-                          final ok = await _verifySlotPassword(
-                            'appBlocker',
-                            'Delete Category',
-                            subtitle: 'Enter App Blocker password to remove "${cat['name']}".',
+                          final expected = (cat['password'] ?? '5555').toString();
+                          final ok = await _verifyPassword(
+                            expected: expected,
+                            title: 'Delete ${cat['name']}',
+                            subtitle: 'Enter this category\'s password to delete "${cat['name']}".',
                           );
                           if (ok) {
                             (_cfg!['appCategories'] as List).removeAt(idx);
                             await _save();
+                            _showSnack('Category "${cat['name']}" deleted.');
                           }
                         },
                       ),

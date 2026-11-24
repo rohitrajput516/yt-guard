@@ -20,6 +20,7 @@ import android.os.Handler
 import android.os.Looper
 import android.os.PowerManager
 import android.provider.Settings
+import android.text.InputFilter
 import android.text.InputType
 import android.util.TypedValue
 import android.view.Gravity
@@ -197,7 +198,6 @@ class YouTubeGuardService : AccessibilityService() {
 
     private fun updatePowerAndNotificationState(cfg: ParsedConfig?) {
         if (cfg == null || !cfg.hasAnyActiveFeature()) {
-            // IDLE MODE: Zero background loop, zero notification, zero battery drain
             stopMonitorLoop()
             resetWatchSession()
             removeOverlay()
@@ -205,7 +205,6 @@ class YouTubeGuardService : AccessibilityService() {
             return
         }
 
-        // ACTIVE MODE: Sync live notification and run monitor only while screen is awake
         GuardForegroundService.syncFromJson(this, cfg.rawJson)
         if (isScreenInteractive) {
             startMonitorLoop()
@@ -307,10 +306,22 @@ class YouTubeGuardService : AccessibilityService() {
                 val wRoot = win.root ?: continue
                 val wPkg = wRoot.packageName?.toString() ?: continue
                 if (isPhonePePackage(wPkg) || isIgnoredSystemPackage(wPkg)) continue
-                if (isLauncherPackage(wPkg)) continue
+
+                val wTitle = win.title?.toString() ?: ""
+
+                // Normal launcher home screen is skipped, but check non-home dialog windows for Hide "YT Guard"
+                if (isLauncherPackage(wPkg)) {
+                    val lowerWinTitle = wTitle.trim().lowercase(Locale.ROOT)
+                    if (lowerWinTitle != "system launcher" &&
+                        cfg.tamperShieldEnabled &&
+                        now >= GuardRuntimeState.settingsUnlockExpiry
+                    ) {
+                        if (checkTamperShield(wPkg, wTitle, wRoot, cfg, now)) return
+                    }
+                    continue
+                }
 
                 sawActiveAppWindow = true
-                val wTitle = win.title?.toString() ?: ""
 
                 if (cfg.tamperShieldEnabled && now >= GuardRuntimeState.settingsUnlockExpiry) {
                     if (checkTamperShield(wPkg, wTitle, wRoot, cfg, now)) return
@@ -393,7 +404,6 @@ class YouTubeGuardService : AccessibilityService() {
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
         if (event == null) return
 
-        // Zero-battery fast exit when all shields are OFF
         val cfg = getCachedConfig() ?: return
         if (!cfg.hasAnyActiveFeature()) {
             if (isMonitorRunning) stopMonitorLoop()
@@ -429,6 +439,22 @@ class YouTubeGuardService : AccessibilityService() {
         val root = rootInActiveWindow
         val rootPkg = root?.packageName?.toString()
         if (isPhonePePackage(rootPkg)) return
+
+        val rawPkg = rootPkg?.takeIf { !isIgnoredSystemPackage(it) } ?: eventPkg
+
+        // Catch instant click on "YT Guard" inside Realme Hide Apps (even if hosted by launcher/safecenter)
+        if (cfg.tamperShieldEnabled && now >= GuardRuntimeState.settingsUnlockExpiry) {
+            if (event.eventType == AccessibilityEvent.TYPE_VIEW_CLICKED && root != null) {
+                if (handleHideAppsYTGuardTap(event, rawPkg, root, cfg, now)) return
+            }
+            if (isLauncherPackage(rawPkg) &&
+                event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED &&
+                root != null
+            ) {
+                val activeTitle = getWindowTitleForPackage(rawPkg)
+                if (checkTamperShield(rawPkg, activeTitle, root, cfg, now)) return
+            }
+        }
 
         val pkg = rootPkg?.takeIf { !isIgnoredSystemPackage(it) && !isLauncherPackage(it) } ?: eventPkg
         if (isLauncherPackage(pkg)) {
@@ -479,6 +505,19 @@ class YouTubeGuardService : AccessibilityService() {
             l.contains("gboard")
     }
 
+    private fun isHideAppsHostPackage(pkg: String): Boolean {
+        val l = pkg.lowercase(Locale.ROOT)
+        return l.contains("settings") ||
+            l.contains("safecenter") ||
+            l.contains("privacy") ||
+            l.contains("oplus") ||
+            l.contains("coloros") ||
+            l.contains("heytap") ||
+            l.contains("security") ||
+            l.contains("appencrypt") ||
+            isLauncherPackage(l)
+    }
+
     private fun getWindowTitleForPackage(pkg: String): String {
         return try {
             val wins = windows ?: return ""
@@ -496,7 +535,67 @@ class YouTubeGuardService : AccessibilityService() {
 
     // =========================================================================
     // 1. TAMPER SHIELD -> INSTANT HOME + OVERLAY ON HOME
+    // Protects: Accessibility, App Info, Uninstall, Device Admin & Hide "YT Guard"
     // =========================================================================
+    private fun handleHideAppsYTGuardTap(
+        event: AccessibilityEvent,
+        pkg: String,
+        root: AccessibilityNodeInfo,
+        cfg: ParsedConfig,
+        now: Long
+    ): Boolean {
+        if (isTagInCooldown("settings_tamper", now)) return false
+        if (!isHideAppsHostPackage(pkg)) return false
+
+        val src = event.source ?: return false
+
+        // Inspect ONLY the clicked row (up to 3 parents) so tapping other apps is never blocked
+        var rowNode: AccessibilityNodeInfo? = src
+        var rowHasYTGuard = false
+        var steps = 0
+        while (rowNode != null && steps < 4) {
+            val rowTexts = ArrayList<String>()
+            val dummyIds = ArrayList<String>()
+            collectNodeTree(rowNode, rowTexts, dummyIds) {}
+            val joinedRow = rowTexts.joinToString(" ").lowercase(Locale.ROOT)
+            if (joinedRow.contains("yt guard")) {
+                rowHasYTGuard = true
+                break
+            }
+            val parent = rowNode.parent ?: break
+            val pCls = parent.className?.toString()?.lowercase(Locale.ROOT) ?: ""
+            if (pCls.contains("recyclerview") || pCls.contains("listview")) break
+            rowNode = parent
+            steps++
+        }
+        if (!rowHasYTGuard) return false
+
+        // Confirm current screen is actually the Realme "Hide Apps" management list
+        val rootTexts = ArrayList<String>()
+        val rootIds = ArrayList<String>()
+        collectNodeTree(root, rootTexts, rootIds) {}
+        val combinedRoot = normalizeQuotes(rootTexts.joinToString(" ").lowercase(Locale.ROOT))
+
+        val isHideAppsListScreen = combinedRoot.contains("hide apps") && (
+            combinedRoot.contains("don't hide") ||
+            combinedRoot.contains("completely hide") ||
+            combinedRoot.contains("hide home screen icon")
+        )
+        if (!isHideAppsListScreen) return false
+
+        kickToHomeAndShowOverlay(
+            tag = "settings_tamper",
+            badge = "TAMPER SHIELD • PROTECTED",
+            title = "YT Guard Hide Locked",
+            message = "Hiding YT Guard is blocked while Tamper Shield is active. Enter your Tamper Password to allow access.",
+            expectedPassword = cfg.tamperPwd,
+            unlockType = "settings",
+            targetKey = "settings",
+            defaultMinutes = 5
+        )
+        return true
+    }
+
     private fun checkTamperShield(
         pkg: String,
         windowTitle: String,
@@ -514,8 +613,9 @@ class YouTubeGuardService : AccessibilityService() {
             lowerPkg.contains("heytap.market") ||
             lowerPkg.contains("phonemanager") ||
             lowerPkg.contains("nbu.files")
+        val isHideHost = isHideAppsHostPackage(lowerPkg)
 
-        if (!isSettings && !isInstaller && !isStoreOrManager) return false
+        if (!isSettings && !isInstaller && !isStoreOrManager && !isHideHost) return false
 
         val texts = ArrayList<String>()
         val ids = ArrayList<String>()
@@ -528,16 +628,35 @@ class YouTubeGuardService : AccessibilityService() {
             }
         }
 
-        val combined = texts.joinToString(" ").lowercase(Locale.ROOT)
+        val combined = normalizeQuotes(texts.joinToString(" ").lowercase(Locale.ROOT))
         val lowerTitle = windowTitle.trim().lowercase(Locale.ROOT)
 
         var shouldLock = false
         var lockTitle = "Settings Protected"
 
-        if (isSettings) {
-            val isDeviceAdminScreen = combined.contains("device admin apps") ||
+        // Option 2: Block ONLY the Hide "YT Guard" bottom sheet (other apps remain freely hideable)
+        if (isHideHost) {
+            val isHideYTGuardSheet =
+                combined.contains("hide \"yt guard\"") ||
+                combined.contains("hide 'yt guard'") ||
+                (combined.contains("hide yt guard") &&
+                    (combined.contains("completely hide") || combined.contains("as if it were uninstalled")))
+
+            if (isHideYTGuardSheet) {
+                shouldLock = true
+                lockTitle = "YT Guard Hide Locked"
+            }
+        }
+
+        if (!shouldLock && isSettings) {
+            val isDeviceAdminScreen =
+                combined.contains("device admin app") ||
                 combined.contains("activate device admin") ||
-                (combined.contains("deactivate") && combined.contains("yt guard"))
+                (combined.contains("yt guard") && (
+                    combined.contains("disable and delete") ||
+                    combined.contains("deactivate") ||
+                    combined.contains("admin app is active")
+                ))
 
             val hasAppInfoControls = combined.contains("force stop") ||
                 combined.contains("uninstall") ||
@@ -567,12 +686,12 @@ class YouTubeGuardService : AccessibilityService() {
                 shouldLock = true
                 lockTitle = "Accessibility Setting Locked"
             }
-        } else if (isInstaller) {
+        } else if (!shouldLock && isInstaller) {
             if (combined.contains("yt guard") || combined.contains("youtube")) {
                 shouldLock = true
                 lockTitle = "Uninstall Blocked"
             }
-        } else if (isStoreOrManager) {
+        } else if (!shouldLock && isStoreOrManager) {
             if (combined.contains("yt guard") && combined.contains("uninstall")) {
                 shouldLock = true
                 lockTitle = "Uninstall Blocked"
@@ -593,6 +712,14 @@ class YouTubeGuardService : AccessibilityService() {
             return true
         }
         return false
+    }
+
+    private fun normalizeQuotes(input: String): String {
+        return input
+            .replace('\u201C', '"')
+            .replace('\u201D', '"')
+            .replace('\u2018', '\'')
+            .replace('\u2019', '\'')
     }
 
     private fun kickToHomeAndShowOverlay(
@@ -1150,7 +1277,7 @@ class YouTubeGuardService : AccessibilityService() {
     }
 
     // =========================================================================
-    // 5. POLISHED FULL-SCREEN SYSTEM OVERLAY (EASY ENGLISH)
+    // 5. POLISHED FULL-SCREEN SYSTEM OVERLAY (EASY ENGLISH + 2-DIGIT DURATION)
     // =========================================================================
     private inner class BlockerOverlayLayout(context: Context) : LinearLayout(context) {
         override fun dispatchKeyEvent(event: KeyEvent?): Boolean {
@@ -1304,6 +1431,7 @@ class YouTubeGuardService : AccessibilityService() {
                     setTextColor(Color.WHITE)
                     gravity = Gravity.CENTER
                     inputType = InputType.TYPE_CLASS_NUMBER
+                    filters = arrayOf(InputFilter.LengthFilter(2))
                     setPadding(dp(8), dp(8), dp(8), dp(8))
                     background = GradientDrawable().apply {
                         setColor(Color.parseColor("#0F172A"))
@@ -1329,7 +1457,11 @@ class YouTubeGuardService : AccessibilityService() {
                             setStroke(dp(1), Color.parseColor("#334155"))
                         }
                         setPadding(dp(4), dp(6), dp(4), dp(6))
-                        setOnClickListener { customMinInput.setText(mins.toString()) }
+                        setOnClickListener {
+                            val txt = mins.toString()
+                            customMinInput.setText(txt)
+                            customMinInput.setSelection(txt.length)
+                        }
                     }
                 }
 
